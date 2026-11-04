@@ -2,6 +2,7 @@ import copy
 import json
 
 import nbformat
+import numpy as np
 import pandas as pd
 import pytest
 import yaml
@@ -55,6 +56,207 @@ def test_changing_selected_scenario_reuses_model_and_cluster_assignments(small_c
     assert model_path.stat().st_mtime_ns == model_timestamp
     assert result.summary["indicator"] == "gdpr_80"
     assert (root / "transformed/gdpr_80/transformed_test.parquet").is_file()
+
+
+def test_cluster_search_skips_infeasible_and_separates_candidate_artifacts(
+    small_search_config,
+):
+    stages.generate_dataset(small_search_config)
+    stages.split_dataset(small_search_config)
+    stages.fit_preprocessor(small_search_config)
+    result = stages.train_model(small_search_config)
+    comparison = pd.read_parquet(
+        small_search_config.artifact_dir / result.artifacts["comparison"]
+    ).set_index("n_clusters")
+
+    assert comparison.loc[2, "status"] == "success"
+    assert comparison.loc[3, "status"] == "success"
+    assert comparison.loc[20, "status"] == "skipped_infeasible"
+    assert "20 * 10 exceeds n_train=150" in comparison.loc[20, "failure_reason"]
+    assert comparison.loc[2, "constraint_violations"] == 0
+    assert {
+        "silhouette_score",
+        "davies_bouldin_index",
+        "calinski_harabasz_index",
+        "minimum_cluster_size",
+        "maximum_cluster_size",
+        "constraint_violations",
+        "training_time_seconds",
+        "status",
+        "failure_reason",
+    }.issubset(comparison.columns)
+    assert comparison.loc[2, "silhouette_status"] in {
+        "available",
+        "undefined: the shared silhouette sample must contain 2..n-1 clusters",
+    }
+
+    root = small_search_config.artifact_dir
+    train_ids = pd.read_parquet(root / "data/train_features.parquet")[
+        "id_row"
+    ].tolist()
+    for candidate in (2, 3):
+        candidate_dir = root / "models/constrained_kmeans/k_{}".format(candidate)
+        assert (candidate_dir / "model.joblib").is_file()
+        assert (candidate_dir / "train_cluster_assignments.parquet").is_file()
+        assert pd.read_parquet(
+            candidate_dir / "train_cluster_assignments.parquet"
+        )["id_row"].tolist() == train_ids
+    skipped_dir = root / "models/constrained_kmeans/k_20"
+    assert not (skipped_dir / "model.joblib").exists()
+
+
+def test_cluster_search_builds_fitted_membership_prototypes_and_selects_without_retraining(
+    small_search_config_path, small_search_config
+):
+    stages.generate_dataset(small_search_config)
+    stages.split_dataset(small_search_config)
+    stages.fit_preprocessor(small_search_config)
+    trained = stages.train_model(small_search_config)
+    prototypes_result = stages.build_prototypes(small_search_config)
+    root = small_search_config.artifact_dir
+
+    for candidate in (2, 3):
+        base = root / "models/constrained_kmeans/k_{}".format(candidate)
+        fitted = storage.read_object(
+            small_search_config,
+            "models/constrained_kmeans/k_{}/model.joblib".format(candidate),
+        )
+        assignments = pd.read_parquet(base / "train_cluster_assignments.parquet")
+        prototypes = pd.read_parquet(base / "cluster_prototypes.parquet")
+        assert assignments["cluster"].tolist() == fitted.labels_.tolist()
+        assert prototypes["n_clients"].min() >= 10
+
+    model_2_path = root / "models/constrained_kmeans/k_2/model.joblib"
+    model_2_timestamp = model_2_path.stat().st_mtime_ns
+    model_3_path = root / "models/constrained_kmeans/k_3/model.joblib"
+    model_3_timestamp = model_3_path.stat().st_mtime_ns
+    settings = yaml.safe_load(small_search_config_path.read_text(encoding="utf-8"))
+    original_model_path = small_search_config.model_config_path
+
+    selected_model = copy.deepcopy(small_search_config.model_config)
+    selected_model["cluster_search"]["selected_n_clusters"] = 2
+    selected_model_path = small_search_config.source_path.parent / "models" / "search_select_2.yml"
+    selected_model_path.write_text(yaml.safe_dump(selected_model), encoding="utf-8")
+    settings["model"]["config_path"] = "models/search_select_2.yml"
+    selected_config_path = small_search_config.source_path.parent / "search_select_2.yml"
+    selected_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    from cluster_representation import load_config
+
+    selected_config = load_config(selected_config_path)
+    selected_training = stages.train_model(selected_config)
+    assert selected_training.artifacts["comparison"] == trained.artifacts["comparison"]
+    assert model_2_path.stat().st_mtime_ns == model_2_timestamp
+    assert model_3_path.stat().st_mtime_ns == model_3_timestamp
+    stages.build_prototypes(selected_config)
+    selected_transform = stages.transform_test(selected_config)
+    assert selected_transform.artifacts["test_assignments"] == (
+        "predictions/constrained_kmeans/k_2/test_cluster_assignments.parquet"
+    )
+    transformed_test = pd.read_parquet(
+        root / selected_transform.artifacts["transformed"]
+    )
+    original_test = pd.read_parquet(root / selected_transform.artifacts["original"])
+    selected_prototypes = pd.read_parquet(
+        root / "models/constrained_kmeans/k_2/cluster_prototypes.parquet"
+    ).set_index("cluster")
+    replaced = transformed_test["gdpr"].eq(1)
+    for feature in ("ft_1", "ft_2", "ft_3"):
+        expected = transformed_test.loc[replaced, "cluster"].map(
+            selected_prototypes[feature]
+        )
+        np.testing.assert_allclose(
+            transformed_test.loc[replaced, feature].to_numpy(dtype=float),
+            expected.to_numpy(dtype=float),
+        )
+    np.testing.assert_allclose(
+        transformed_test.loc[
+            ~replaced, ["ft_1", "ft_2", "ft_3"]
+        ].to_numpy(dtype=float),
+        original_test.loc[
+            ~replaced, ["ft_1", "ft_2", "ft_3"]
+        ].to_numpy(dtype=float),
+    )
+
+    extended_model = copy.deepcopy(small_search_config.model_config)
+    extended_model["cluster_search"]["candidates"] = [2, 3, 4, 20]
+    extended_model["cluster_search"]["selected_n_clusters"] = 2
+    extended_model_path = small_search_config.source_path.parent / "models" / "search_extended.yml"
+    extended_model_path.write_text(yaml.safe_dump(extended_model), encoding="utf-8")
+    settings["model"]["config_path"] = "models/search_extended.yml"
+    extended_config_path = small_search_config.source_path.parent / "search_extended.yml"
+    extended_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
+    extended_config = load_config(extended_config_path)
+    extended_training = stages.train_model(extended_config)
+    assert model_2_path.stat().st_mtime_ns == model_2_timestamp
+    assert (root / "models/constrained_kmeans/k_4/model.joblib").is_file()
+    assert extended_training.artifacts["comparison"] != trained.artifacts["comparison"]
+
+    stages.build_prototypes(extended_config)
+    transformed = stages.transform_test(extended_config)
+    assert transformed.artifacts["test_assignments"] == (
+        "predictions/constrained_kmeans/k_2/test_cluster_assignments.parquet"
+    )
+    assert model_2_path.stat().st_mtime_ns == model_2_timestamp
+    assert (
+        root / "models/constrained_kmeans/k_2/cluster_prototypes.parquet"
+    ).is_file()
+    evaluation_result = stages.evaluate(extended_config)
+    assert evaluation_result.artifacts["metrics"] == "metrics/constrained_kmeans/k_2/results.json"
+    assert original_model_path.name == "search.yml"
+    assert prototypes_result.summary["selected_n_clusters"] == 3
+
+
+def test_cluster_search_rejects_infeasible_selected_candidate_for_downstream(
+    small_search_config,
+):
+    stages.generate_dataset(small_search_config)
+    stages.split_dataset(small_search_config)
+    stages.fit_preprocessor(small_search_config)
+    stages.train_model(small_search_config)
+    settings = yaml.safe_load(small_search_config.source_path.read_text(encoding="utf-8"))
+    model = copy.deepcopy(small_search_config.model_config)
+    model["cluster_search"]["selected_n_clusters"] = 20
+    model_path = small_search_config.source_path.parent / "models" / "search_select_infeasible.yml"
+    model_path.write_text(yaml.safe_dump(model), encoding="utf-8")
+    settings["model"]["config_path"] = "models/search_select_infeasible.yml"
+    config_path = small_search_config.source_path.parent / "select_infeasible.yml"
+    config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    from cluster_representation import load_config
+
+    config = load_config(config_path)
+    with pytest.raises(ValueError, match="Selected cluster count 20 was not successfully trained"):
+        stages.transform_test(config)
+
+
+def test_cluster_search_records_model_fit_failures(small_search_config, monkeypatch):
+    stages.generate_dataset(small_search_config)
+    stages.split_dataset(small_search_config)
+    stages.fit_preprocessor(small_search_config)
+    original_create_model = stages.create_model
+
+    class FailingCandidate:
+        def fit(self, X):
+            raise RuntimeError(
+                "deliberate candidate failure for input shape {}".format(X.shape)
+            )
+
+    def create_model_with_failure(model_config):
+        if model_config["parameters"]["n_clusters"] == 3:
+            return FailingCandidate()
+        return original_create_model(model_config)
+
+    monkeypatch.setattr(stages, "create_model", create_model_with_failure)
+    result = stages.train_model(small_search_config)
+    comparison = pd.read_parquet(
+        small_search_config.artifact_dir / result.artifacts["comparison"]
+    ).set_index("n_clusters")
+    assert comparison.loc[3, "status"] == "failed"
+    assert "deliberate candidate failure" in comparison.loc[3, "failure_reason"]
+    assert (small_search_config.artifact_dir / "models/constrained_kmeans/k_2/model.joblib").is_file()
+    assert not (
+        small_search_config.artifact_dir / "models/constrained_kmeans/k_3/model.joblib"
+    ).exists()
 
 
 def test_individual_stage_requires_prerequisite(small_config):

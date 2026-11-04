@@ -1,8 +1,9 @@
 """Public, artifact-backed workflow stages shared by CLI and notebooks."""
 
 from dataclasses import dataclass
+import json
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from . import generation, nonconsent, preprocessing, prototypes, reporting, spli
 from . import storage, transformation
 from .config import LoadedConfig
 from .models import create_model
+from .randomness import generator
 from .validation import validate_stage_artifacts
 
 
@@ -36,6 +38,11 @@ class StageResult:
         return str(path)
 
     def report(self) -> Any:
+        comparison_path = self.artifacts.get("comparison")
+        if comparison_path is not None:
+            return reporting.cluster_search_report(
+                storage.read_frame(self.config, comparison_path)
+            )
         metrics_path = self.artifacts.get("metrics")
         if metrics_path is None:
             return self.summary
@@ -169,7 +176,18 @@ def train_model(config: LoadedConfig) -> StageResult:
         train_features[config["dataset"]["id_column"]]
     ):
         raise ValueError("Saved preprocessor was fitted on different training IDs")
-    model = create_model(config.model_config)
+    if config.model_config.get("cluster_search", {}).get("enabled", False):
+        return _train_cluster_search(
+            config,
+            train_features,
+            fitted_preprocessor.transform(train_features[names]),
+            preprocessor_fp,
+        )
+
+    model_config = dict(config.model_config)
+    model_config["parameters"] = dict(config.model_config["parameters"])
+    model_config.pop("cluster_search", None)
+    model = create_model(model_config)
     fit_started = time.perf_counter()
     model.fit(fitted_preprocessor.transform(train_features[names]))
     fit_seconds = time.perf_counter() - fit_started
@@ -209,8 +227,288 @@ def train_model(config: LoadedConfig) -> StageResult:
     )
 
 
+def _train_cluster_search(
+    config: LoadedConfig,
+    train_features: pd.DataFrame,
+    train_inputs: np.ndarray,
+    preprocessor_fingerprint: str,
+) -> StageResult:
+    search = config.model_config["cluster_search"]
+    n_train = len(train_features)
+    id_column = config["dataset"]["id_column"]
+    seed = config.model_config["parameters"]["random_state"]
+    sample_size = min(n_train, config["evaluation"]["silhouette_sample_size"])
+    sample_rng = generator(seed, "cluster-search:silhouette")
+    silhouette_indices = np.sort(
+        sample_rng.choice(n_train, size=sample_size, replace=False)
+    )
+    rows = []
+    candidate_artifacts: Dict[str, str] = {}
+    minimum_size = config.model_config["constraints"]["min_cluster_size"]
+
+    for candidate in search["candidates"]:
+        base = "models/constrained_kmeans/k_{}".format(candidate)
+        paths = {
+            "model": base + "/model.joblib",
+            "assignments": base + "/train_cluster_assignments.parquet",
+            "metadata": base + "/metadata.json",
+        }
+        stage_key = storage.candidate_stage_key("train_model", candidate)
+        fingerprint = storage.candidate_training_fingerprint(config, candidate)
+        candidate_exists = False
+        try:
+            record = storage.require_stage(config, stage_key, fingerprint, [])
+            candidate_result = dict(record.get("metadata", {}))
+            candidate_exists = True
+        except FileNotFoundError:
+            candidate_result = {}
+        if candidate_exists:
+            if candidate_result.get("status") == "success":
+                storage.require_stage(
+                    config, stage_key, fingerprint, paths.values()
+                )
+        else:
+            if candidate * minimum_size > n_train:
+                candidate_result = _candidate_result(
+                    candidate,
+                    status="skipped_infeasible",
+                    failure_reason=(
+                        "{} * {} exceeds n_train={}".format(
+                            candidate, minimum_size, n_train
+                        )
+                    ),
+                )
+                storage.record_stage(
+                    config,
+                    stage_key,
+                    fingerprint,
+                    [],
+                    {"fit_preprocessor": preprocessor_fingerprint},
+                    candidate_result,
+                )
+            else:
+                candidate_model_config = {
+                    "name": "constrained_kmeans",
+                    "parameters": dict(config.model_config["parameters"]),
+                    "constraints": config.model_config["constraints"],
+                }
+                candidate_model_config["parameters"]["n_clusters"] = candidate
+                model = create_model(candidate_model_config)
+                started = time.perf_counter()
+                try:
+                    model.fit(train_inputs)
+                except (ValueError, RuntimeError) as exc:
+                    training_seconds = time.perf_counter() - started
+                    candidate_result = _candidate_result(
+                        candidate,
+                        status="failed",
+                        failure_reason="{}: {}".format(type(exc).__name__, exc),
+                        training_time_seconds=training_seconds,
+                    )
+                    storage.record_stage(
+                        config,
+                        stage_key,
+                        fingerprint,
+                        [],
+                        {"fit_preprocessor": preprocessor_fingerprint},
+                        candidate_result,
+                    )
+                else:
+                    training_seconds = time.perf_counter() - started
+                    labels = np.asarray(model.labels_, dtype=int)
+                    counts = np.bincount(labels, minlength=candidate + 1)[1:]
+                    if len(counts) != candidate:
+                        raise RuntimeError(
+                            "Candidate {} returned an unexpected number of clusters".format(
+                                candidate
+                            )
+                        )
+                    violations = np.flatnonzero(counts < minimum_size) + 1
+                    metrics = evaluation.evaluate_training_candidate(
+                        train_inputs, labels, silhouette_indices
+                    )
+                    candidate_result = _candidate_result(
+                        candidate,
+                        status="success",
+                        failure_reason=None,
+                        training_time_seconds=training_seconds,
+                        constraint_violations=int(len(violations)),
+                        constraint_violation_clusters=violations.tolist(),
+                        training_id_fingerprint=_ids_fingerprint(
+                            train_features[id_column]
+                        ),
+                        feature_order=[feature["name"] for feature in config["features"]],
+                        model_parameters=json.dumps(
+                            candidate_model_config["parameters"], sort_keys=True
+                        ),
+                        constraints=json.dumps(
+                            candidate_model_config["constraints"], sort_keys=True
+                        ),
+                        **metrics
+                    )
+                    assignments = pd.DataFrame(
+                        {
+                            id_column: train_features[id_column].to_numpy(),
+                            "cluster": labels,
+                        }
+                    )
+                    storage.write_object(config, paths["model"], model)
+                    storage.write_frame(config, paths["assignments"], assignments)
+                    storage.write_json(config, paths["metadata"], candidate_result)
+                    storage.record_stage(
+                        config,
+                        stage_key,
+                        fingerprint,
+                        list(paths.values()),
+                        {"fit_preprocessor": preprocessor_fingerprint},
+                        candidate_result,
+                    )
+        rows.append(candidate_result)
+        if candidate_result["status"] == "success":
+            candidate_artifacts["model_k_{}".format(candidate)] = paths["model"]
+            candidate_artifacts["assignments_k_{}".format(candidate)] = paths[
+                "assignments"
+            ]
+
+    comparison = pd.DataFrame(rows)
+    search_fingerprint = storage.cluster_search_fingerprint(config)
+    comparison_path = "models/constrained_kmeans/search_{}/comparison.parquet".format(
+        search_fingerprint[:12]
+    )
+    search_stage_key = "train_model:search:{}".format(search_fingerprint[:12])
+    try:
+        storage.require_stage(
+            config,
+            search_stage_key,
+            search_fingerprint,
+            [comparison_path],
+        )
+    except FileNotFoundError:
+        storage.write_frame(config, comparison_path, comparison)
+        storage.record_stage(
+            config,
+            search_stage_key,
+            search_fingerprint,
+            [comparison_path],
+            {
+                storage.candidate_stage_key("train_model", candidate):
+                    storage.candidate_training_fingerprint(config, candidate)
+                for candidate in search["candidates"]
+            },
+            {"candidate_count": len(search["candidates"])},
+        )
+    else:
+        comparison = storage.read_frame(config, comparison_path)
+    candidate_artifacts["comparison"] = comparison_path
+    selected_row = comparison.loc[
+        comparison["n_clusters"].eq(search["selected_n_clusters"])
+    ].iloc[0]
+    return StageResult(
+        "train_model",
+        candidate_artifacts,
+        {
+            "training_rows": n_train,
+            "candidate_count": len(search["candidates"]),
+            "selected_n_clusters": search["selected_n_clusters"],
+            "selected_status": selected_row["status"],
+            "candidates": rows,
+        },
+        config,
+    )
+
+
+def _candidate_result(
+    n_clusters: int,
+    status: str,
+    failure_reason: Optional[str],
+    training_time_seconds: Optional[float] = None,
+    minimum_cluster_size: Optional[int] = None,
+    maximum_cluster_size: Optional[int] = None,
+    constraint_violations: Optional[int] = None,
+    constraint_violation_clusters: Optional[list] = None,
+    **metrics: Any
+) -> Dict[str, Any]:
+    result = {
+        "n_clusters": n_clusters,
+        "status": status,
+        "failure_reason": failure_reason,
+        "minimum_cluster_size": minimum_cluster_size,
+        "maximum_cluster_size": maximum_cluster_size,
+        "constraint_violations": constraint_violations,
+        "constraint_violation_clusters": constraint_violation_clusters or [],
+        "training_time_seconds": training_time_seconds,
+        "silhouette_score": None,
+        "silhouette_status": "not_evaluated",
+        "davies_bouldin_index": None,
+        "davies_bouldin_status": "not_evaluated",
+        "calinski_harabasz_index": None,
+        "calinski_harabasz_status": "not_evaluated",
+    }
+    result.update(metrics)
+    return result
+
+
+def _candidate_training_paths(n_clusters: int) -> Tuple[str, str, str]:
+    base = "models/constrained_kmeans/k_{}".format(n_clusters)
+    return (
+        base + "/model.joblib",
+        base + "/train_cluster_assignments.parquet",
+        base + "/metadata.json",
+    )
+
+
+def _candidate_prototype_path(n_clusters: int) -> str:
+    return "models/constrained_kmeans/k_{}/cluster_prototypes.parquet".format(
+        n_clusters
+    )
+
+
+def _cluster_search_comparison_path(config: LoadedConfig) -> str:
+    fingerprint = storage.cluster_search_fingerprint(config)
+    return "models/constrained_kmeans/search_{}/comparison.parquet".format(
+        fingerprint[:12]
+    )
+
+
+def _cluster_search_stage_key(config: LoadedConfig) -> str:
+    fingerprint = storage.cluster_search_fingerprint(config)
+    return "train_model:search:{}".format(fingerprint[:12])
+
+
+def _require_selected_candidate(config: LoadedConfig, n_clusters: int) -> tuple:
+    model_path, assignments_path, metadata_path = _candidate_training_paths(n_clusters)
+    key = storage.candidate_stage_key("train_model", n_clusters)
+    fingerprint = storage.candidate_training_fingerprint(config, n_clusters)
+    record = storage.require_stage(config, key, fingerprint, [])
+    metadata = record.get("metadata", {})
+    if metadata.get("status") != "success":
+        raise ValueError(
+            "Selected cluster count {} was not successfully trained ({}: {}).".format(
+                n_clusters,
+                metadata.get("status", "missing status"),
+                metadata.get("failure_reason") or "no failure details",
+            )
+        )
+    storage.require_stage(
+        config, key, fingerprint, [model_path, assignments_path, metadata_path]
+    )
+    return model_path, assignments_path, metadata_path
+
+
+def _require_selected_candidate_prototypes(
+    config: LoadedConfig, n_clusters: int
+) -> str:
+    path = _candidate_prototype_path(n_clusters)
+    key = storage.candidate_stage_key("build_prototypes", n_clusters)
+    fingerprint = storage.candidate_prototype_fingerprint(config, n_clusters)
+    storage.require_stage(config, key, fingerprint, [path])
+    return path
+
+
 def build_prototypes(config: LoadedConfig) -> StageResult:
     config = _require_config(config)
+    if config.model_config.get("cluster_search", {}).get("enabled", False):
+        return _build_cluster_search_prototypes(config)
     train_fp = storage.stage_fingerprint(config, "train_model")
     model_path = "models/model.joblib"
     metadata_path = "models/metadata.json"
@@ -255,6 +553,128 @@ def build_prototypes(config: LoadedConfig) -> StageResult:
     )
 
 
+def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
+    search = config.model_config["cluster_search"]
+    train_path = "data/train_features.parquet"
+    split_fingerprint = storage.stage_fingerprint(config, "split_dataset")
+    validate_stage_artifacts(config, "split_dataset", split_fingerprint, [train_path])
+    train_features = storage.read_frame(config, train_path)
+    comparison_path = _cluster_search_comparison_path(config)
+    search_fingerprint = storage.cluster_search_fingerprint(config)
+    storage.require_stage(
+        config,
+        _cluster_search_stage_key(config),
+        search_fingerprint,
+        [comparison_path],
+    )
+    comparison = storage.read_frame(config, comparison_path)
+    minimum_size = config.model_config["constraints"]["min_cluster_size"]
+    artifacts: Dict[str, str] = {"comparison": comparison_path}
+    candidate_summaries = []
+
+    for candidate_row in comparison.to_dict(orient="records"):
+        candidate = int(candidate_row["n_clusters"])
+        if candidate_row["status"] != "success":
+            continue
+        model_path, assignment_path, metadata_path = _candidate_training_paths(candidate)
+        candidate_train_key = storage.candidate_stage_key("train_model", candidate)
+        candidate_train_fingerprint = storage.candidate_training_fingerprint(
+            config, candidate
+        )
+        training_record = storage.require_stage(
+            config,
+            candidate_train_key,
+            candidate_train_fingerprint,
+            [model_path, assignment_path, metadata_path],
+        )
+        if training_record["metadata"].get("status") != "success":
+            raise ValueError(
+                "Candidate {} has no successful fitted training artifacts".format(candidate)
+            )
+        model = storage.read_object(config, model_path)
+        saved_assignments = storage.read_frame(config, assignment_path)
+        expected_ids = train_features[config["dataset"]["id_column"]].tolist()
+        if saved_assignments[config["dataset"]["id_column"]].tolist() != expected_ids:
+            raise ValueError(
+                "Candidate {} training assignments do not align with training IDs".format(
+                    candidate
+                )
+            )
+        fitted_labels = np.asarray(model.labels_, dtype=int)
+        if not np.array_equal(fitted_labels, saved_assignments["cluster"].to_numpy()):
+            raise ValueError(
+                "Candidate {} saved assignments differ from fitted training labels".format(
+                    candidate
+                )
+            )
+        prototype_path = _candidate_prototype_path(candidate)
+        prototype_key = storage.candidate_stage_key("build_prototypes", candidate)
+        prototype_fingerprint = storage.candidate_prototype_fingerprint(
+            config, candidate
+        )
+        prototype_exists = False
+        try:
+            storage.require_stage(
+                config, prototype_key, prototype_fingerprint, []
+            )
+            prototype_exists = True
+        except FileNotFoundError:
+            pass
+        if prototype_exists:
+            storage.require_stage(
+                config, prototype_key, prototype_fingerprint, [prototype_path]
+            )
+            prototype_frame = storage.read_frame(config, prototype_path)
+        else:
+            built = prototypes.build_prototypes(
+                train_features, fitted_labels, config, minimum_size
+            )
+            prototype_frame = built["prototypes"]
+            storage.write_frame(config, prototype_path, prototype_frame)
+            storage.record_stage(
+                config,
+                prototype_key,
+                prototype_fingerprint,
+                [prototype_path],
+                {candidate_train_key: candidate_train_fingerprint},
+                {
+                    "n_clusters": len(prototype_frame),
+                    "support": prototype_frame["n_clients"].astype(int).tolist(),
+                    "minimum_cluster_size": minimum_size,
+                },
+            )
+        artifacts["prototypes_k_{}".format(candidate)] = prototype_path
+        candidate_summaries.append(
+            {
+                "n_clusters": candidate,
+                "minimum_support": int(prototype_frame["n_clients"].min()),
+            }
+        )
+
+    selected = search["selected_n_clusters"]
+    selected_prototype_key = "prototypes_k_{}".format(selected)
+    if selected_prototype_key not in artifacts:
+        selected_row = comparison.loc[comparison["n_clusters"].eq(selected)].iloc[0]
+        raise ValueError(
+            "Selected cluster count {} was not successfully trained ({}: {}).".format(
+                selected,
+                selected_row["status"],
+                selected_row["failure_reason"] or "no failure details",
+            )
+        )
+    artifacts["prototypes"] = artifacts[selected_prototype_key]
+    artifacts["assignments"] = _candidate_training_paths(selected)[1]
+    return StageResult(
+        "build_prototypes",
+        artifacts,
+        {
+            "candidate_prototypes": candidate_summaries,
+            "selected_n_clusters": search["selected_n_clusters"],
+        },
+        config,
+    )
+
+
 def transform_test(config: LoadedConfig) -> StageResult:
     config = _require_config(config)
     transformed = _run_transformation(config, config["transformation"]["selected_indicator"])
@@ -262,10 +682,26 @@ def transform_test(config: LoadedConfig) -> StageResult:
 
 
 def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResult:
+    selected_k = storage.selected_candidate(config)
     fingerprint = storage.stage_fingerprint(config, "transform_test")
-    stage_key = "transform_test:{}".format(indicator_name)
-    transformed_path = "transformed/{}/transformed_test.parquet".format(indicator_name)
-    original_path = "transformed/{}/original_test.parquet".format(indicator_name)
+    if selected_k is None:
+        stage_key = "transform_test:{}".format(indicator_name)
+        prediction_stage_key = "predict_test_clusters"
+        scenario_dir = "transformed/{}".format(indicator_name)
+        prediction_path = "predictions/test_cluster_assignments.parquet"
+    else:
+        stage_key = "transform_test:k_{}:{}".format(selected_k, indicator_name)
+        scenario_dir = "transformed/constrained_kmeans/k_{}/{}".format(
+            selected_k, indicator_name
+        )
+        prediction_stage_key = "predict_test_clusters:k_{}".format(selected_k)
+        prediction_path = (
+            "predictions/constrained_kmeans/k_{}/test_cluster_assignments.parquet".format(
+                selected_k
+            )
+        )
+    transformed_path = scenario_dir + "/transformed_test.parquet"
+    original_path = scenario_dir + "/original_test.parquet"
     manifest_path = storage.artifact_path(config, storage.MANIFEST_NAME)
     if manifest_path.exists():
         manifest = storage.initialize_run(config)
@@ -282,7 +718,7 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
                 {
                     "transformed": transformed_path,
                     "original": original_path,
-                    "test_assignments": "predictions/test_cluster_assignments.parquet",
+                    "test_assignments": prediction_path,
                 },
                 {
                     "indicator": indicator_name,
@@ -306,24 +742,29 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
         config, "fit_preprocessor", dependencies["fit_preprocessor"],
         ["preprocessing/preprocessor.joblib"],
     )
-    validate_stage_artifacts(
-        config, "train_model", dependencies["train_model"], ["models/model.joblib"]
-    )
-    validate_stage_artifacts(
-        config, "build_prototypes", dependencies["build_prototypes"],
-        ["prototypes/cluster_prototypes.parquet"],
-    )
+    if selected_k is None:
+        validate_stage_artifacts(
+            config, "train_model", dependencies["train_model"], ["models/model.joblib"]
+        )
+        validate_stage_artifacts(
+            config, "build_prototypes", dependencies["build_prototypes"],
+            ["prototypes/cluster_prototypes.parquet"],
+        )
+        model_path = "models/model.joblib"
+        prototypes_path = "prototypes/cluster_prototypes.parquet"
+    else:
+        model_path, _, _ = _require_selected_candidate(config, selected_k)
+        prototypes_path = _require_selected_candidate_prototypes(config, selected_k)
     test = storage.read_frame(config, "data/test_features.parquet")
     test_indicators = storage.read_frame(config, "data/test_indicators.parquet")
-    prototypes_frame = storage.read_frame(config, "prototypes/cluster_prototypes.parquet")
+    prototypes_frame = storage.read_frame(config, prototypes_path)
     preprocessor = storage.read_object(config, "preprocessing/preprocessor.joblib")
-    model = storage.read_object(config, "models/model.joblib")
+    model = storage.read_object(config, model_path)
     prediction_fp = storage.stage_fingerprint(config, "predict_test_clusters")
-    prediction_path = "predictions/test_cluster_assignments.parquet"
     try:
         storage.require_stage(
             config,
-            "predict_test_clusters",
+            prediction_stage_key,
             prediction_fp,
             [prediction_path],
         )
@@ -336,7 +777,7 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
         storage.write_frame(config, prediction_path, assignments)
         storage.record_stage(
             config,
-            "predict_test_clusters",
+            prediction_stage_key,
             prediction_fp,
             [prediction_path],
             {
@@ -361,9 +802,6 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
         indicator_name,
     )
     replacement_seconds = time.perf_counter() - replacement_started
-    scenario_dir = "transformed/{}".format(indicator_name)
-    transformed_path = scenario_dir + "/transformed_test.parquet"
-    original_path = scenario_dir + "/original_test.parquet"
     storage.write_frame(config, transformed_path, transformed["transformed"])
     storage.write_frame(config, original_path, transformed["original"])
     storage.record_stage(
@@ -405,15 +843,38 @@ def evaluate(config: LoadedConfig) -> StageResult:
     config = _require_config(config)
     if not config["evaluation"]["enabled"]:
         return StageResult("evaluate", {}, {"enabled": False}, config)
-    _run_transformation(config, config["transformation"]["selected_indicator"])
+    transform_result = _run_transformation(
+        config, config["transformation"]["selected_indicator"]
+    )
+    selected_k = storage.selected_candidate(config)
+    if selected_k is None:
+        model_path = "models/model.joblib"
+        prototype_path = "prototypes/cluster_prototypes.parquet"
+        train_record_key = "train_model"
+        prediction_record_key = "predict_test_clusters"
+        transform_record_key = "transform_test:{}".format(
+            config["transformation"]["selected_indicator"]
+        )
+        metrics_path = "metrics/results.json"
+        evaluation_stage_key = "evaluate"
+    else:
+        model_path, _, _ = _require_selected_candidate(config, selected_k)
+        prototype_path = _require_selected_candidate_prototypes(config, selected_k)
+        train_record_key = storage.candidate_stage_key("train_model", selected_k)
+        prediction_record_key = "predict_test_clusters:k_{}".format(selected_k)
+        transform_record_key = "transform_test:k_{}:{}".format(
+            selected_k, config["transformation"]["selected_indicator"]
+        )
+        metrics_path = "metrics/constrained_kmeans/k_{}/results.json".format(
+            selected_k
+        )
+        evaluation_stage_key = "evaluate:k_{}".format(selected_k)
     test = storage.read_frame(config, "data/test_features.parquet")
     test_indicators = storage.read_frame(config, "data/test_indicators.parquet")
-    assignments = storage.read_frame(
-        config, "predictions/test_cluster_assignments.parquet"
-    )
+    assignments = storage.read_frame(config, transform_result.artifacts["test_assignments"])
     train = storage.read_frame(config, "data/train_features.parquet")
     train_indicators = storage.read_frame(config, "data/train_indicators.parquet")
-    model = storage.read_object(config, "models/model.joblib")
+    model = storage.read_object(config, model_path)
     fitted_preprocessor = storage.read_object(config, "preprocessing/preprocessor.joblib")
     names = [feature["name"] for feature in config["features"]]
     train_inputs = fitted_preprocessor.transform(train[names])
@@ -423,7 +884,7 @@ def evaluate(config: LoadedConfig) -> StageResult:
     scenario_outputs = {}
     requested_rates = {}
     full_indicators = storage.read_frame(config, "data/nonconsent.parquet")
-    prototype_frame = storage.read_frame(config, "prototypes/cluster_prototypes.parquet")
+    prototype_frame = storage.read_frame(config, prototype_path)
     for column in test_indicators.columns:
         if column == config["dataset"]["id_column"]:
             continue
@@ -446,11 +907,9 @@ def evaluate(config: LoadedConfig) -> StageResult:
         scenario_outputs[column] = transformed["transformed"]
     manifest = storage.initialize_run(config)
     stage_records = manifest.get("stages", {})
-    model_record = stage_records.get("train_model", {})
-    prediction_record = stage_records.get("predict_test_clusters", {})
-    selected_record = stage_records.get(
-        "transform_test:{}".format(config["transformation"]["selected_indicator"]), {}
-    )
+    model_record = stage_records.get(train_record_key, {})
+    prediction_record = stage_records.get(prediction_record_key, {})
+    selected_record = stage_records.get(transform_record_key, {})
     report = evaluation.evaluate(
         train_inputs,
         labels,
@@ -461,7 +920,10 @@ def evaluate(config: LoadedConfig) -> StageResult:
         requested_rates,
         config,
         timings={
-            "fitting": model_record.get("metadata", {}).get("fit_seconds"),
+            "fitting": model_record.get("metadata", {}).get(
+                "fit_seconds",
+                model_record.get("metadata", {}).get("training_time_seconds"),
+            ),
             "prediction": prediction_record.get("metadata", {}).get("prediction_seconds"),
             "replacement": selected_record.get("metadata", {}).get("replacement_seconds"),
         },
@@ -472,27 +934,31 @@ def evaluate(config: LoadedConfig) -> StageResult:
                 "data/train_features.parquet",
                 "data/test_features.parquet",
                 "preprocessing/preprocessor.joblib",
-                "models/model.joblib",
-                "prototypes/train_cluster_assignments.parquet",
-                "prototypes/cluster_prototypes.parquet",
-                "predictions/test_cluster_assignments.parquet",
-                "transformed/{}/transformed_test.parquet".format(
-                    config["transformation"]["selected_indicator"]
-                ),
+                model_path,
+                prototype_path,
+                transform_result.artifacts["test_assignments"],
+                transform_result.artifacts["transformed"],
             ],
         ),
     )
-    metrics_path = "metrics/results.json"
     storage.write_json(config, metrics_path, report)
     fingerprint = storage.stage_fingerprint(config, "evaluate")
-    dependencies = {
-        "train_model": storage.stage_fingerprint(config, "train_model"),
+    dependencies =     {
+        train_record_key: (
+            storage.candidate_training_fingerprint(config, selected_k)
+            if selected_k is not None
+            else storage.stage_fingerprint(config, "train_model")
+        ),
         "predict_test_clusters": storage.stage_fingerprint(config, "predict_test_clusters"),
-        "build_prototypes": storage.stage_fingerprint(config, "build_prototypes"),
+        "build_prototypes": (
+            storage.candidate_prototype_fingerprint(config, selected_k)
+            if selected_k is not None
+            else storage.stage_fingerprint(config, "build_prototypes")
+        ),
     }
     storage.record_stage(
         config,
-        "evaluate",
+        evaluation_stage_key,
         fingerprint,
         [metrics_path],
         dependencies,

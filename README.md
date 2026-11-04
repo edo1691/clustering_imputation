@@ -113,6 +113,47 @@ Existing artifacts are not overwritten unless `output.overwrite: true` is config
 
 All application implementation lives in `src/cluster_representation/`. The CLI and notebooks call the same stage functions.
 
+## Constrained K-means cluster search
+
+The K-means model configuration can use `cluster_search` to fit a supplied list
+of cluster counts. For example:
+
+```yaml
+name: constrained_kmeans
+parameters:
+  random_state: 12345
+  max_iter: 300
+  n_init: 10
+cluster_search:
+  enabled: true
+  candidates: [5, 6, 7, 8, 9, 10]
+  selected_n_clusters: 5
+constraints:
+  type: minimum_cluster_size
+  min_cluster_size: 100
+```
+
+Candidate counts must be unique positive integers; nonconsecutive values are
+valid. Candidates that do not satisfy `K * min_cluster_size <= n_train` are
+recorded as skipped in the comparison report. Each feasible candidate is fitted
+independently on the same saved training split and fitted preprocessing. Scores
+are calculated using training data only, and the same deterministic sample is
+used for silhouette comparisons. Each candidate's model, fitted training
+assignments, metadata, and training-median prototypes are saved in their own
+`models/constrained_kmeans/k_<K>/` directory.
+
+`selected_n_clusters` chooses which successfully trained candidate is used for
+test assignment and replacement; it does not cause candidate models to be
+refitted. If the selected candidate was skipped or failed, downstream stages
+stop with an explicit error. The training notebook displays the saved
+comparison table and package-generated score plot. Legacy single-model
+configurations with `parameters.n_clusters` and no `cluster_search` remain
+supported.
+
+`constrained_coclustering` and `robust_constrained_coclustering` remain
+configuration-only templates: their `fit()` and `predict()` methods explicitly
+raise `NotImplementedError`.
+
 ## Notebooks
 
 Install development dependencies into `.venv` before starting Jupyter. They must include JupyterLab and `ipykernel`.

@@ -14,6 +14,71 @@ from sklearn.metrics import (
 from .randomness import generator
 
 
+def evaluate_training_candidate(
+    X: Any, labels: Any, silhouette_indices: np.ndarray
+) -> Dict[str, Any]:
+    """Evaluate one fitted training partition using a shared silhouette sample."""
+    values = np.asarray(X, dtype=float)
+    cluster_labels = np.asarray(labels, dtype=int)
+    if values.ndim != 2 or cluster_labels.ndim != 1 or len(cluster_labels) != len(values):
+        raise ValueError("Training features and fitted labels must align")
+    if silhouette_indices.ndim != 1 or (
+        len(silhouette_indices)
+        and (silhouette_indices.min() < 0 or silhouette_indices.max() >= len(values))
+    ):
+        raise ValueError("Silhouette sample indices are outside the training data")
+
+    unique, counts = np.unique(cluster_labels, return_counts=True)
+    result: Dict[str, Any] = {
+        "minimum_cluster_size": int(counts.min()),
+        "maximum_cluster_size": int(counts.max()),
+        "silhouette_score": None,
+        "silhouette_status": "undefined",
+        "davies_bouldin_index": None,
+        "davies_bouldin_status": "undefined",
+        "calinski_harabasz_index": None,
+        "calinski_harabasz_status": "undefined",
+    }
+    if len(unique) < 2 or len(unique) >= len(cluster_labels):
+        reason = "requires 2 <= clusters < training rows"
+        for key in ("silhouette", "davies_bouldin", "calinski_harabasz"):
+            result[key + "_status"] = "undefined: " + reason
+        return result
+
+    sample_labels = cluster_labels[silhouette_indices]
+    if len(np.unique(sample_labels)) < 2 or len(np.unique(sample_labels)) >= len(sample_labels):
+        result["silhouette_status"] = (
+            "undefined: the shared silhouette sample must contain 2..n-1 clusters"
+        )
+    else:
+        try:
+            result["silhouette_score"] = float(
+                silhouette_score(values[silhouette_indices], sample_labels)
+            )
+            result["silhouette_status"] = "available"
+        except ValueError as exc:
+            result["silhouette_status"] = "undefined: {}".format(exc)
+
+    for function, value_key, status_key in (
+        (
+            davies_bouldin_score,
+            "davies_bouldin_index",
+            "davies_bouldin_status",
+        ),
+        (
+            calinski_harabasz_score,
+            "calinski_harabasz_index",
+            "calinski_harabasz_status",
+        ),
+    ):
+        try:
+            result[value_key] = float(function(values, cluster_labels))
+            result[status_key] = "available"
+        except ValueError as exc:
+            result[status_key] = "undefined: {}".format(exc)
+    return result
+
+
 def evaluate(
     train_model_inputs: Any,
     train_labels: Any,

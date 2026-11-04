@@ -65,3 +65,36 @@ def small_config_path(tmp_path):
 @pytest.fixture
 def small_config(small_config_path):
     return load_config(small_config_path)
+
+
+@pytest.fixture
+def small_search_config_path(small_config_path):
+    settings = yaml.safe_load(small_config_path.read_text(encoding="utf-8"))
+    model_path = small_config_path.parent / "models" / "search.yml"
+    model_config = {
+        "name": "constrained_kmeans",
+        "parameters": {
+            "random_state": 12345,
+            "max_iter": 40,
+            "n_init": 2,
+        },
+        "cluster_search": {
+            "enabled": True,
+            "candidates": [2, 3, 20],
+            "selected_n_clusters": 3,
+        },
+        "constraints": {
+            "type": "minimum_cluster_size",
+            "min_cluster_size": 10,
+        },
+    }
+    model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
+    settings["model"]["config_path"] = "models/search.yml"
+    settings["output"]["run_name"] = "search_run"
+    small_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    return small_config_path
+
+
+@pytest.fixture
+def small_search_config(small_search_config_path):
+    return load_config(small_search_config_path)

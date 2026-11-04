@@ -68,6 +68,7 @@ class LoadedConfig(dict):
     def fingerprint(self) -> str:
         serializable = copy.deepcopy(dict(self))
         serializable["model"]["config_path"] = str(self.model_config_path)
+        serializable["resolved_model_config"] = self.model_config
         payload = json.dumps(serializable, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -187,16 +188,82 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
     _mapping(model, "model configuration")
     name = model.get("name")
     if name == "constrained_kmeans":
-        _keys(model, {"name", "parameters", "constraints"}, "model configuration")
+        allowed_model_keys = {"name", "parameters", "constraints", "cluster_search"}
+        _keys(model, allowed_model_keys, "model configuration")
         _require(model, {"name", "parameters", "constraints"}, "model configuration")
         parameters = _mapping(model["parameters"], "model.parameters")
-        _keys(
-            parameters,
-            {"n_clusters", "random_state", "max_iter", "n_init"},
-            "model.parameters",
-        )
-        _require(parameters, {"n_clusters", "random_state", "max_iter", "n_init"}, "model.parameters")
-        _integer(parameters["n_clusters"], "model.parameters.n_clusters", 2)
+        search = model.get("cluster_search")
+        if search is None:
+            _keys(
+                parameters,
+                {"n_clusters", "random_state", "max_iter", "n_init"},
+                "model.parameters",
+            )
+            _require(
+                parameters,
+                {"n_clusters", "random_state", "max_iter", "n_init"},
+                "model.parameters",
+            )
+            _integer(parameters["n_clusters"], "model.parameters.n_clusters", 2)
+        else:
+            _keys(
+                parameters,
+                {"n_clusters", "random_state", "max_iter", "n_init"},
+                "model.parameters",
+            )
+            _require(parameters, {"random_state", "max_iter", "n_init"}, "model.parameters")
+            search = _mapping(search, "model.cluster_search")
+            _keys(
+                search,
+                {"enabled", "candidates", "selected_n_clusters"},
+                "model.cluster_search",
+            )
+            _require(
+                search,
+                {"enabled", "candidates", "selected_n_clusters"},
+                "model.cluster_search",
+            )
+            if not isinstance(search["enabled"], bool):
+                raise ConfigurationError("model.cluster_search.enabled must be boolean")
+            candidates = search["candidates"]
+            if not isinstance(candidates, list) or not candidates:
+                raise ConfigurationError(
+                    "model.cluster_search.candidates must be a non-empty list"
+                )
+            for index, candidate in enumerate(candidates):
+                _integer(
+                    candidate,
+                    "model.cluster_search.candidates[{}]".format(index),
+                    1,
+                )
+            if len(set(candidates)) != len(candidates):
+                raise ConfigurationError(
+                    "model.cluster_search.candidates must contain unique values"
+                )
+            selected = _integer(
+                search["selected_n_clusters"],
+                "model.cluster_search.selected_n_clusters",
+                1,
+            )
+            if selected not in candidates:
+                raise ConfigurationError(
+                    "model.cluster_search.selected_n_clusters must be a candidate"
+                )
+            if "n_clusters" in parameters:
+                configured_n_clusters = _integer(
+                    parameters["n_clusters"], "model.parameters.n_clusters", 1
+                )
+                if search["enabled"]:
+                    raise ConfigurationError(
+                        "model.parameters.n_clusters must be omitted when cluster search is enabled"
+                    )
+                if configured_n_clusters != selected:
+                    raise ConfigurationError(
+                        "model.parameters.n_clusters must match selected_n_clusters "
+                        "when cluster search is disabled"
+                    )
+            if not search["enabled"] and "n_clusters" not in parameters:
+                parameters["n_clusters"] = selected
         _integer(parameters["random_state"], "model.parameters.random_state", 0)
         _integer(parameters["max_iter"], "model.parameters.max_iter", 1)
         _integer(parameters["n_init"], "model.parameters.n_init", 1)
@@ -352,14 +419,14 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
         raise ConfigurationError("model.config_path must be a non-empty path")
     model_path = (source_path.parent / model_path_value).resolve()
     model_config = _validate_model_config(model_path)
-    if model_config["name"] == "constrained_kmeans":
+    if model_config["name"] == "constrained_kmeans" and "cluster_search" not in model_config:
         params = model_config["parameters"]
         minimum = model_config["constraints"]["min_cluster_size"]
         if params["n_clusters"] * minimum > n_rows - n_test:
             raise ConfigurationError(
                 "n_clusters * min_cluster_size exceeds the expected training row count"
             )
-    else:
+    elif model_config["name"] != "constrained_kmeans":
         params = model_config["parameters"]
         minimum = model_config["constraints"]["min_row_cluster_size"]
         if params["n_row_clusters"] * minimum > n_rows - n_test:

@@ -60,6 +60,43 @@ def test_config_accepts_constrained_coclustering_and_rejects_trimming(
         load_config(small_config_path)
 
 
+@pytest.mark.parametrize(
+    "candidates, selected",
+    [
+        ([2, 2], 2),
+        ([0, 3], 3),
+        ([True, 3], 3),
+        ([2, 3], 4),
+    ],
+)
+def test_cluster_search_candidates_are_positive_unique_integers_and_selectable(
+    small_search_config_path, candidates, selected
+):
+    settings = yaml.safe_load(
+        small_search_config_path.read_text(encoding="utf-8")
+    )
+    model_path = small_search_config_path.parent / "models" / "search.yml"
+    model_config = yaml.safe_load(model_path.read_text(encoding="utf-8"))
+    model_config["cluster_search"]["candidates"] = candidates
+    model_config["cluster_search"]["selected_n_clusters"] = selected
+    model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
+    small_search_config_path.write_text(
+        yaml.safe_dump(settings), encoding="utf-8"
+    )
+    with pytest.raises(ConfigurationError, match="candidates|selected_n_clusters"):
+        load_config(small_search_config_path)
+
+
+def test_cluster_search_accepts_nonconsecutive_candidates(small_search_config_path):
+    model_path = small_search_config_path.parent / "models" / "search.yml"
+    model_config = yaml.safe_load(model_path.read_text(encoding="utf-8"))
+    model_config["cluster_search"]["candidates"] = [5, 6, 7, 8, 13, 15, 40]
+    model_config["cluster_search"]["selected_n_clusters"] = 13
+    model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
+    loaded = load_config(small_search_config_path)
+    assert loaded.model_config["cluster_search"]["candidates"] == [5, 6, 7, 8, 13, 15, 40]
+
+
 def test_generation_reproducibility_and_independent_feature_streams(small_config):
     first = generate_features(small_config)
     repeated = generate_features(small_config)

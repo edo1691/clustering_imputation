@@ -47,9 +47,23 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
             "features": config["features"],
         }
     elif stage == "train_model":
+        model_settings = config.model_config
+        if (
+            model_settings["name"] == "constrained_kmeans"
+            and model_settings.get("cluster_search", {}).get("enabled", False)
+        ):
+            model_settings = {
+                "name": model_settings["name"],
+                "parameters": {
+                    key: value
+                    for key, value in model_settings["parameters"].items()
+                    if key != "n_clusters"
+                },
+                "constraints": model_settings["constraints"],
+            }
         settings = {
             "preprocessor": stage_fingerprint(config, "fit_preprocessor"),
-            "model": config.model_config,
+            "model": model_settings,
         }
     elif stage == "build_prototypes":
         settings = {
@@ -61,6 +75,7 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
             "split": stage_fingerprint(config, "split_dataset"),
             "preprocessor": stage_fingerprint(config, "fit_preprocessor"),
             "model": stage_fingerprint(config, "train_model"),
+            "selected_candidate": selected_candidate(config),
         }
     elif stage == "transform_test":
         settings = {
@@ -79,6 +94,63 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
         }
     else:
         raise ValueError("Unknown stage fingerprint: {}".format(stage))
+    payload = json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def selected_candidate(config: LoadedConfig) -> Optional[int]:
+    search = config.model_config.get("cluster_search")
+    if (
+        config.model_config["name"] == "constrained_kmeans"
+        and search
+        and search["enabled"]
+    ):
+        return int(search["selected_n_clusters"])
+    return None
+
+
+def candidate_training_fingerprint(config: LoadedConfig, n_clusters: int) -> str:
+    model = config.model_config
+    settings = {
+        "preprocessor": stage_fingerprint(config, "fit_preprocessor"),
+        "model": model["name"],
+        "parameters": {
+            key: value
+            for key, value in model["parameters"].items()
+            if key not in {"n_clusters", "cluster_search"}
+        },
+        "constraints": model["constraints"],
+        "n_clusters": n_clusters,
+    }
+    return _fingerprint(settings)
+
+
+def candidate_prototype_fingerprint(config: LoadedConfig, n_clusters: int) -> str:
+    return _fingerprint(
+        {
+            "training_candidate": candidate_training_fingerprint(config, n_clusters),
+            "prototypes": config["prototypes"],
+        }
+    )
+
+
+def candidate_stage_key(stage: str, n_clusters: int) -> str:
+    return "{}:constrained_kmeans:k_{}".format(stage, n_clusters)
+
+
+def cluster_search_fingerprint(config: LoadedConfig) -> str:
+    search = config.model_config.get("cluster_search")
+    if not search:
+        raise ValueError("This configuration does not enable cluster search")
+    return _fingerprint(
+        {
+            "model": stage_fingerprint(config, "train_model"),
+            "candidates": search["candidates"],
+        }
+    )
+
+
+def _fingerprint(settings: Mapping[str, Any]) -> str:
     payload = json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -289,6 +361,7 @@ def _atomic_write(target: Path, content: str) -> None:
 
 def _serializable_config(config: LoadedConfig) -> Dict[str, Any]:
     settings = json.loads(json.dumps(dict(config), default=str))
+    settings["resolved_model_config"] = config.model_config
     return settings
 
 
