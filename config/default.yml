@@ -76,4 +76,4 @@ pipeline:
 output:
   root: ../artifacts
   run_name: example_run
-  overwrite: false
+  overwrite: true

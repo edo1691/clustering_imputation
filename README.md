@@ -1,192 +1,191 @@
-# Synthetic Cluster Representation
-
-A reproducible Python package for independently generated numeric features,
-minimum-size-constrained K-means, training-derived cluster prototypes, and
-scenario-based replacement of test features. YAML can select
-`constrained_kmeans`, `constrained_coclustering`, or
-`robust_constrained_coclustering` through `model.config_path`.
-
-> This is a software-validation example, not a realistic customer-behavior
-> model. Independent synthetic features do not establish meaningful behavioral
-> clusters. Replacing values alone does not establish anonymity or regulatory
-> compliance.
-
 ## Installation
 
-Python 3.9 or newer is supported. From the repository root:
+Run all commands from the repository root.
+
+Use a Python version compatible with the project's `requires-python` setting in `pyproject.toml`.
+
+### macOS / Linux
+
+Create a project-local virtual environment:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python3 -m venv .venv
 ```
 
-On Windows PowerShell, activate with:
+Install the package and development dependencies inside it:
+
+```bash
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/python -m pip install -e ".[dev]"
+```
+
+Verify the interpreter and environment:
+
+```bash
+./.venv/bin/python -c "import sys; print('Interpreter:', sys.executable); print('Virtual environment:', sys.prefix != sys.base_prefix)"
+```
+
+The interpreter path should point inside this repository's `.venv`, and the virtual-environment check should print `True`.
+
+### Windows PowerShell
+
+Create and install into the project-local environment:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
+Verify it:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sys; print('Interpreter:', sys.executable); print('Virtual environment:', sys.prefix != sys.base_prefix)"
+```
+
+### Optional activation
+
+Activation makes shorter commands available in the current terminal.
+
+macOS / Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+Windows PowerShell:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-The required dependencies include NumPy, pandas, PyYAML, scikit-learn,
-PyArrow/Parquet, joblib, and `k-means-constrained`. The constrained model uses
-the latter package's `KMeansConstrained` estimator with explicit mappings:
-`n_clusters`, `size_min`, `random_state`, `max_iter`, and `n_init`. Its fitted
-training cluster sizes are checked against the configured minimum. Test
-assignments use nearest fitted centroids and are not size constrained.
+After activation, use `python -m pip`, `python -m pytest`, and `python -m cluster_representation`.
+
+The explicit interpreter commands below work without activation. No global installation, `sudo pip`, or `pip install --user` is needed.
+
+Keep `.venv/` in `.gitignore`. Recreate the environment on each machine rather than committing or copying it.
 
 ## Run the workflow
 
-Run the complete configured pipeline:
+From the repository root, run the complete configured pipeline.
+
+macOS / Linux:
 
 ```bash
-python -m cluster_representation --config config/default.yml
-# or, after installation:
-cluster-representation --config config/default.yml
+./.venv/bin/python -m cluster_representation --config config/default.yml
 ```
 
-Run a single stage after its prerequisites have been saved:
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m cluster_representation --config config/default.yml
+```
+
+Run an individual stage after its prerequisites have been saved.
+
+macOS / Linux:
 
 ```bash
-python -m cluster_representation \
+./.venv/bin/python -m cluster_representation \
   --config config/default.yml \
   --step generate_dataset
 ```
 
-Supported `--step` values are `generate_dataset`, `split_dataset`,
-`fit_preprocessor`, `train_model`, `build_prototypes`, `transform_test`, and
-`evaluate`. Each stage validates prerequisite artifacts and gives an actionable
-error if an earlier stage is missing. Existing output artifacts are not
-overwritten unless `output.overwrite: true` is set; a new `output.run_name` is
-the recommended way to start a separate run.
+Windows PowerShell:
 
-All implementation is under `src/cluster_representation/`; tests are in
-`tests/`. The package entry point and installed console command call the same
-stage APIs used by the notebooks.
+```powershell
+.\.venv\Scripts\python.exe -m cluster_representation --config config/default.yml --step generate_dataset
+```
 
-## Configuration
+Supported stages:
 
-`config/default.yml` documents the complete configuration. Feature names must
-be contiguous and ordered (`ft_1`, `ft_2`, ...). Supported distributions and
-their parameters are:
+- `generate_dataset`
+- `split_dataset`
+- `fit_preprocessor`
+- `train_model`
+- `build_prototypes`
+- `transform_test`
+- `evaluate`
 
-| Distribution | Parameters | Meaning |
-|---|---|---|
-| `normal` | `mean`, `std` | Normal mean and positive standard deviation |
-| `uniform` | `low`, `high` | Lower-inclusive and upper-exclusive bounds |
-| `exponential` | `scale` | Positive scale (mean) |
-| `poisson` | `lam` | Non-negative event rate |
-| `binomial` | `n`, `p` | Number of trials and success probability |
-| `lognormal` | `mean`, `sigma` | Mean and positive standard deviation of the underlying normal |
+Each stage validates its prerequisite artifacts and reports missing or incompatible inputs.
 
-Relative paths are resolved against the YAML file that declares them. For
-example, `model.config_path` in `config/default.yml` resolves within `config/`,
-and `output.root: ../artifacts` resolves from that same directory.
-Select the implemented K-means model or either co-clustering template by
-changing `model.config_path` to `models/constrained_kmeans.yml`,
-`models/constrained_coclustering.yml`, or
-`models/robust_constrained_coclustering.yml`, respectively. The two
-co-clustering templates validate and load through the shared pipeline, but
-training stops with an explicit `NotImplementedError` until their algorithms
-are implemented.
+Existing artifacts are not overwritten unless `output.overwrite: true` is configured. Use a new `output.run_name` for a separate experiment.
 
-Configuration loading rejects unknown keys, invalid distribution parameters,
-invalid percentage schedules, incompatible model settings, and stage sequences
-that omit prerequisites. `gdpr=1` means that replacement is required; `gdpr=0`
-means original values are retained. The non-consent indicators are simulation
-scenarios, not supervised prediction targets. Counts use
-`floor(n_rows * percentage / 100)` and are exact for the full dataset.
-
-## Data and modeling assumptions
-
-* Each feature receives a deterministic random stream keyed by the master seed
-  and feature name. Adding another feature does not alter existing features.
-  Python's built-in `hash()` and global random state are not used.
-* Non-consent scenarios are saved separately from generated feature values.
-  Nested scenarios use prefixes of one reproducible permutation; independent
-  scenarios use separate reproducible streams.
-* The deterministic train/test split does not stratify on non-consent status.
-  Saved split tables retain original IDs and their original ID order. Actual
-  overall, train, and test scenario rates are reported separately.
-* Imputation and optional standard scaling are fitted only on training
-  features. IDs and `gdpr_*` columns are excluded from model inputs.
-* All original `ft_*` features are used for assignment. Training memberships
-  from the constrained fit define cluster assignments and original-unit
-  feature medians; test memberships are never used to build prototypes.
-* Minimum cluster size applies to fitted training clusters and therefore to
-  prototype support. Replacement medians remain fractional when appropriate.
-* For test customers, assignment happens before replacement. Every feature is
-  replaced with its training-cluster median when `gdpr=1`, and every original
-  feature is retained when `gdpr=0`. Original test values are saved separately
-  for evaluation.
-* The assumption is: “Original transactional features are accessible for
-  cluster assignment. For simulated non-consenting customers, their direct
-  downstream representation is replaced with training-derived cluster
-  medians.”
-
-## Artifacts
-
-Each run is written under `artifacts/<run_name>/`, including the resolved
-configuration, manifest, environment versions, generated and split Parquet
-data, fitted preprocessor and model, prototype assignments and medians,
-predictions, transformed scenario outputs, and machine-readable metrics.
-Manifest records include stage-specific fingerprints, artifact dependencies,
-schemas/parameters where relevant, training-ID references, and timestamps.
-Changing only the selected replacement scenario does not invalidate model
-training, prototypes, or test cluster assignments.
-
-The evaluation reports clustering metrics in preprocessed model-input space
-and replacement errors in original feature units. Overall MAE aggregates
-features on different scales and should be interpreted accordingly. Metrics
-that cannot be defined for the available cluster/sample configuration are
-reported as unavailable. Replaced-row MAE is unavailable when no test rows are
-replaced. Silhouette sampling uses a deterministic stream.
+All application implementation lives in `src/cluster_representation/`. The CLI and notebooks call the same stage functions.
 
 ## Notebooks
 
-Install the package first, then launch Jupyter from the `notebooks/` directory:
+Install development dependencies into `.venv` before starting Jupyter. They must include JupyterLab and `ipykernel`.
+
+Launch Jupyter using the virtual environment's Python, with `notebooks/` as the working directory.
+
+macOS / Linux:
 
 ```bash
 cd notebooks
-jupyter lab
+../.venv/bin/python -m jupyterlab
 ```
 
-The notebooks use `../config/default.yml`, call package stage functions, and
-display their result summaries. They do not modify `sys.path`, contain model or
-data-processing implementations, or depend on state from another notebook.
-Run stages in order; each notebook stage loads saved prerequisites.
-To select a separate YAML configuration for a notebook run, set
-`CLUSTER_REPRESENTATION_CONFIG` to its path before starting Jupyter.
+Windows PowerShell:
+
+```powershell
+Set-Location notebooks
+..\.venv\Scripts\python.exe -m jupyterlab
+```
+
+Select the Python kernel belonging to this repository's `.venv`.
+
+If it is not listed, register it from the repository root:
+
+macOS / Linux:
+
+```bash
+./.venv/bin/python -m ipykernel install \
+  --prefix .venv \
+  --name synthetic-cluster-representation \
+  --display-name "Python (.venv — Synthetic Cluster Representation)"
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m ipykernel install --prefix .venv --name synthetic-cluster-representation --display-name "Python (.venv - Synthetic Cluster Representation)"
+```
+
+Restart Jupyter and select that kernel. Registration is local to `.venv`.
+
+To inspect the interpreter used by a notebook:
+
+```python
+import sys
+
+print(sys.executable)
+```
+
+It should point inside the repository's `.venv`.
+
+Notebooks load `../config/default.yml`, call package stage functions, and display returned summaries. All processing, model logic, validation, plotting, and artifact saving remain in `src/`.
+
+Notebooks must not install dependencies, modify `sys.path`, duplicate implementation, or depend on variables from other notebooks.
+
+Run stages in order. Each stage loads its saved prerequisites.
+
+To choose another configuration, set `CLUSTER_REPRESENTATION_CONFIG` before launching Jupyter. An absolute path avoids working-directory ambiguity.
 
 ## Tests
 
+Run tests from the repository root using the virtual environment.
+
+macOS / Linux:
+
 ```bash
-pytest
+./.venv/bin/python -m pytest
 ```
 
-The tests cover configuration validation, reproducibility, exact scenario
-counts, split integrity, training-only preprocessing, constrained fitting,
-serialization, prototypes, replacement behavior, artifact checks, the future
-model's explicit errors, and a small end-to-end pipeline.
+Windows PowerShell:
 
-## Future work (not implemented)
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
 
-The registered `constrained_coclustering` and
-`robust_constrained_coclustering` models are configuration-only. Both `fit()`
-and `predict()` raise `NotImplementedError`; no simulated results are
-generated. The constrained template has no robustness or trimming options;
-the robust template additionally includes row and column trimming fractions.
-Their notebooks only display the template configurations. Before implementing
-either algorithm, define:
-
-* How a new observation receives a row-cluster prediction.
-* For the robust variant, whether trimmed observations may receive clusters
-  and contribute prototypes.
-* For the robust variant, how trimmed features participate in inference and
-  reports.
-* For the robust variant, whether trimmed observations/features contribute to
-  prototype support.
-
-Other planned research extensions are cluster-count selection, correlated
-features and latent customer groups, customer-feature block structure,
-outlier-robustness experiments, and downstream predictive evaluation using a
-separate outcome `y`. None are implemented or claimed by this package.
+Tests cover configuration validation, reproducibility, exact scenario counts, split integrity, training-only preprocessing, constrained fitting, serialization, prototype construction, feature replacement, artifact compatibility, model-template errors, and a small end-to-end pipeline.
