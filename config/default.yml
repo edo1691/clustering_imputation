@@ -1,0 +1,79 @@
+dataset:
+  n_rows: 10000
+  seed: 12345
+  id_column: id_row
+
+features:
+  - name: ft_1
+    distribution: normal
+    parameters:
+      mean: 0
+      std: 1
+  - name: ft_2
+    distribution: uniform
+    parameters:
+      low: 0
+      high: 100
+  - name: ft_3
+    distribution: exponential
+    parameters:
+      scale: 2
+  - name: ft_4
+    distribution: poisson
+    parameters:
+      lam: 5
+  - name: ft_5
+    distribution: binomial
+    parameters:
+      n: 10
+      p: 0.3
+  - name: ft_6
+    distribution: lognormal
+    parameters:
+      mean: 0
+      sigma: 1
+
+nonconsent:
+  prefix: gdpr
+  start_percent: 10
+  end_percent: 100
+  step_percent: 10
+  assignment: nested
+  count_rounding: floor
+
+split:
+  test_size: 0.2
+  seed: 12345
+
+preprocessing:
+  imputation: median
+  scaling: standard
+
+model:
+  config_path: models/constrained_kmeans.yml
+
+prototypes:
+  aggregation: median
+
+transformation:
+  selected_indicator: gdpr_20
+  replace_when: 1
+
+evaluation:
+  enabled: true
+  silhouette_sample_size: 2000
+
+pipeline:
+  steps:
+    - generate_dataset
+    - split_dataset
+    - fit_preprocessor
+    - train_model
+    - build_prototypes
+    - transform_test
+    - evaluate
+
+output:
+  root: ../artifacts
+  run_name: example_run
+  overwrite: false

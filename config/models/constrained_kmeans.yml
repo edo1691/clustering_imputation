@@ -1,0 +1,11 @@
+name: constrained_kmeans
+
+parameters:
+  n_clusters: 5
+  random_state: 12345
+  max_iter: 300
+  n_init: 10
+
+constraints:
+  type: minimum_cluster_size
+  min_cluster_size: 100

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cluster-representation"
+version = "0.1.0"
+description = "Reproducible synthetic data, constrained clustering, and feature replacement."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "joblib>=1.2,<2",
+    "k-means-constrained>=0.7.3,<0.8",
+    "numpy>=1.23,<2",
+    "pandas>=1.5,<3",
+    "pyarrow>=10,<20",
+    "PyYAML>=6,<7",
+    "scikit-learn>=1.2,<1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel>=6.20",
+    "jupyter>=1.0",
+    "matplotlib>=3.6",
+    "pytest>=7.2",
+    "seaborn>=0.12",
+]
+
+[project.scripts]
+cluster-representation = "cluster_representation.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
