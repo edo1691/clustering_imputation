@@ -255,13 +255,38 @@ def record_stage(
     _write_manifest(config, manifest)
 
 
-def write_frame(config: LoadedConfig, relative: str, frame: pandas.DataFrame) -> Path:
+def write_frame(
+    config: LoadedConfig,
+    relative: str,
+    frame: pandas.DataFrame,
+    overwrite_existing: bool = False,
+) -> Path:
     target = artifact_path(config, relative)
-    _prepare_target(config, target)
+    _prepare_target(config, target, allow_existing=overwrite_existing)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
     frame.to_parquet(temporary, index=False)
     os.replace(str(temporary), str(target))
+    return target
+
+
+def write_csv(
+    config: LoadedConfig,
+    relative: str,
+    frame: pandas.DataFrame,
+    overwrite_existing: bool = False,
+) -> Path:
+    target = artifact_path(config, relative)
+    _prepare_target(config, target, allow_existing=overwrite_existing)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    try:
+        frame.to_csv(temporary, index=False)
+        os.replace(str(temporary), str(target))
+    except Exception:
+        if temporary.exists():
+            temporary.unlink()
+        raise
     return target
 
 
@@ -321,8 +346,10 @@ def file_sizes(config: LoadedConfig, relative_paths: Iterable[str]) -> Dict[str,
     }
 
 
-def _prepare_target(config: LoadedConfig, target: Path) -> None:
-    if target.exists() and not config["output"]["overwrite"]:
+def _prepare_target(
+    config: LoadedConfig, target: Path, allow_existing: bool = False
+) -> None:
+    if target.exists() and not config["output"]["overwrite"] and not allow_existing:
         raise FileExistsError(
             "Refusing to overwrite artifact {}. Set output.overwrite=true or use "
             "a new run_name.".format(target)

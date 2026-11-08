@@ -8,8 +8,9 @@ import pytest
 import yaml
 
 from cluster_representation import load_config
-from cluster_representation import pipeline, stages, storage
+from cluster_representation import pipeline, reporting, stages, storage, transformation
 from cluster_representation.evaluation import evaluate
+from cluster_representation.models.constrained_kmeans import ConstrainedKMeans
 
 
 def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
@@ -34,6 +35,124 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     assert len(metrics["scenarios"]) == 6
     assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mae"] is None
     assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mae_status"] == "unavailable_no_replaced_rows"
+    combined = reporting.combined_evaluation_report(small_config)
+    assert len(combined) == 6
+    assert combined["Clusters"].eq(3).all()
+    assert combined.loc[
+        combined["Non-consent (%)"].eq(0), "MAE (replaced rows) ↓"
+    ].iloc[0] == "N/A"
+    assert (root / "metrics/combined_evaluation.csv").is_file()
+    assert (root / "metrics/combined_evaluation.parquet").is_file()
+
+
+def test_combined_report_aligns_scenarios_and_reuses_fitted_candidates(
+    small_search_config, monkeypatch
+):
+    results = pipeline.run(small_search_config)
+    train_result = next(result for result in results if result.stage == "train_model")
+    root = small_search_config.artifact_dir
+    comparison = pd.read_parquet(root / train_result.artifacts["comparison"])
+    successful = comparison.loc[comparison["status"].eq("success")]
+
+    def fail_if_fit(*args, **kwargs):
+        raise AssertionError("Reporting must not fit or retrain models")
+
+    monkeypatch.setattr(ConstrainedKMeans, "fit", fail_if_fit)
+    display = reporting.combined_evaluation_report(small_search_config)
+
+    exported = pd.read_parquet(root / "metrics/combined_evaluation.parquet")
+    exported_csv = pd.read_csv(root / "metrics/combined_evaluation.csv")
+    assert len(exported) == len(successful) * 6
+    assert not exported.duplicated(
+        ["model", "n_clusters", "nonconsent_percent"]
+    ).any()
+    pd.testing.assert_frame_equal(
+        exported,
+        exported_csv,
+        check_dtype=False,
+        check_exact=False,
+    )
+    assert display.columns.tolist() == [
+        "Model",
+        "Clusters",
+        "Non-consent (%)",
+        "Smallest cluster",
+        "Silhouette ↑",
+        "Davies–Bouldin ↓",
+        "Calinski–Harabasz ↑",
+        "MAE ↓",
+        "MAE (replaced rows) ↓",
+        "Realized test non-consent (%)",
+    ]
+
+    candidate = 2
+    row = exported.loc[
+        exported["n_clusters"].eq(candidate)
+        & exported["nonconsent_percent"].eq(20)
+    ].iloc[0]
+    comparison_row = comparison.loc[comparison["n_clusters"].eq(candidate)].iloc[0]
+    assert row["silhouette_score"] == pytest.approx(
+        comparison_row["silhouette_score"]
+    )
+    assert row["davies_bouldin_index"] == pytest.approx(
+        comparison_row["davies_bouldin_index"]
+    )
+    assert row["calinski_harabasz_index"] == pytest.approx(
+        comparison_row["calinski_harabasz_index"]
+    )
+    assert row["smallest_cluster_size"] == comparison_row["minimum_cluster_size"]
+
+    test = storage.read_frame(small_search_config, "data/test_features.parquet")
+    indicators = storage.read_frame(
+        small_search_config, "data/test_indicators.parquet"
+    )
+    preprocessor = storage.read_object(
+        small_search_config, "preprocessing/preprocessor.joblib"
+    )
+    model = storage.read_object(
+        small_search_config,
+        "models/constrained_kmeans/k_2/model.joblib",
+    )
+    prototypes = storage.read_frame(
+        small_search_config,
+        "models/constrained_kmeans/k_2/cluster_prototypes.parquet",
+    )
+    assignments = transformation.assign_test_clusters(
+        test, small_search_config, preprocessor, model
+    )["assignments"]
+    transformed = transformation.transform_test(
+        test,
+        indicators[["id_row", "gdpr_20"]],
+        prototypes,
+        assignments,
+        small_search_config,
+        "gdpr_20",
+    )["transformed"]
+    feature_names = [feature["name"] for feature in small_search_config["features"]]
+    errors = np.abs(
+        transformed[feature_names].to_numpy(dtype=float)
+        - test[feature_names].to_numpy(dtype=float)
+    )
+    replaced = transformed["gdpr"].eq(1).to_numpy()
+    assert row["mae"] == pytest.approx(float(errors.mean()))
+    assert row["mae_replaced_rows"] == pytest.approx(
+        float(errors[replaced].mean())
+    )
+    assert row["realized_test_nonconsent_percent"] == pytest.approx(
+        float(indicators["gdpr_20"].mean() * 100.0)
+    )
+    zero_scenario = exported.loc[
+        exported["n_clusters"].eq(candidate)
+        & exported["nonconsent_percent"].eq(0)
+    ].iloc[0]
+    assert zero_scenario["mae_replaced_rows"] != zero_scenario[
+        "mae_replaced_rows"
+    ]
+    assert display.loc[
+        display["Clusters"].eq(candidate)
+        & display["Non-consent (%)"].eq(0),
+        "MAE (replaced rows) ↓",
+    ].iloc[0] == "N/A"
 
 
 def test_changing_selected_scenario_reuses_model_and_cluster_assignments(small_config):
@@ -290,6 +409,7 @@ def test_notebooks_are_valid_and_thin():
         if path.name not in {
             "04_future_coclustering.ipynb",
             "08_constrained_coclustering.ipynb",
+            "07_evaluate.ipynb",
         }:
             assert "stages." in code
 

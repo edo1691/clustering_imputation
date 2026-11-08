@@ -150,6 +150,15 @@ comparison table and package-generated score plot. Legacy single-model
 configurations with `parameters.n_clusters` and no `cluster_search` remain
 supported.
 
+The evaluation notebook writes `metrics/combined_evaluation.csv` and
+`metrics/combined_evaluation.parquet`. Search runs include one row for each
+successfully trained candidate and configured non-consent scenario. Training
+cluster metrics are reused from the candidate comparison, and test replacement
+errors are calculated from each saved candidate model and prototype without
+refitting. The returned notebook table uses readable labels and displays
+unavailable values as `N/A`; the exported files retain machine-readable column
+names and null metric values.
+
 `constrained_coclustering` and `robust_constrained_coclustering` remain
 configuration-only templates: their `fit()` and `predict()` methods explicitly
 raise `NotImplementedError`.
@@ -205,7 +214,9 @@ print(sys.executable)
 
 It should point inside the repository's `.venv`.
 
-Notebooks load `../config/default.yml`, call package stage functions, and display returned summaries. All processing, model logic, validation, plotting, and artifact saving remain in `src/`.
+Notebooks load `../config/default.yml`, call package stage or reporting
+functions, and display returned summaries. All processing, model logic,
+validation, plotting, and artifact saving remain in `src/`.
 
 Notebooks must not install dependencies, modify `sys.path`, duplicate implementation, or depend on variables from other notebooks.
 
