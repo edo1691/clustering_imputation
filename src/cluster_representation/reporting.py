@@ -26,6 +26,7 @@ _COMBINED_COLUMNS = [
 ]
 
 _OVERALL_COMPARISON_PATH = "tables/overall_comparison.md"
+_FEATURE_EVALUATION_PATH = "tables/feature_evaluation.md"
 _CLUSTER_SELECTION_COMPARISON_PATH = "tables/cluster_selection_comparison.md"
 
 
@@ -47,17 +48,36 @@ def metrics_table(metrics: Mapping[str, Any]) -> pd.DataFrame:
                 ],
                 "n_replaced": values["n_replaced"],
                 "overall_test_mae": values["overall_test_mae"],
-                "replaced_rows_mae": values["replaced_rows_mae"],
-                "replaced_rows_nmae": values["replaced_rows_nmae"],
-                "replaced_rows_nmae_status": values[
+                "replaced_rows_mae": values.get("replaced_rows_mae"),
+                "replaced_rows_mape": values.get("replaced_rows_mape"),
+                "replaced_rows_nmae": values.get("replaced_rows_nmae"),
+                "replaced_rows_nmae_status": values.get(
                     "replaced_rows_nmae_status"
-                ],
-                "per_feature_replaced_rows_mae": values[
+                ),
+                "per_feature_replaced_rows_mae": values.get(
                     "per_feature_replaced_rows_mae"
-                ],
-                "per_feature_replaced_rows_nmae": values[
+                ),
+                "per_feature_replaced_rows_mae_status": values.get(
+                    "per_feature_replaced_rows_mae_status"
+                ),
+                "per_feature_replaced_rows_mape": values.get(
+                    "per_feature_replaced_rows_mape"
+                ),
+                "per_feature_replaced_rows_mape_status": values.get(
+                    "per_feature_replaced_rows_mape_status"
+                ),
+                "per_feature_replaced_rows_mape_valid_cells": values.get(
+                    "per_feature_replaced_rows_mape_valid_cells"
+                ),
+                "per_feature_replaced_rows_mape_excluded_zero_cells": values.get(
+                    "per_feature_replaced_rows_mape_excluded_zero_cells"
+                ),
+                "per_feature_replaced_rows_nmae": values.get(
                     "per_feature_replaced_rows_nmae"
-                ],
+                ),
+                "per_feature_replaced_rows_nmae_status": values.get(
+                    "per_feature_replaced_rows_nmae_status"
+                ),
             }
         )
     return pd.DataFrame(rows)
@@ -202,7 +222,6 @@ def export_overall_comparison(
             _format_available_metric(
                 metrics.get("classification_metrics", {}).get("f1")
             ),
-            _markdown_number(scenario_metrics.get("replaced_rows_mae")),
             _markdown_number(scenario_metrics.get("replaced_rows_nmae")),
             _markdown_number(scenario_metrics.get("replaced_rows_mape")),
             _markdown_number(cluster_count),
@@ -219,15 +238,15 @@ def export_overall_comparison(
         [
             "### Overall comparison of evaluated methods",
             "",
-            "| Method | NC (%) | AP | F1 | MAE | NMAE (train SD) ↓ | MAPE (%) | \\|G\\| | k̄ | Time (s) |",
-            "|--------|--------|----|----|-----|-------------------|----------|-------|----|----------|",
+            "| Method | NC (%) | AP | F1 | N MAE | MAPE (%) | \\|G\\| | k̄ | Time (s) |",
+            "|--------|--------|----|----|-------|----------|-------|----|----------|",
             *rows,
             "",
-            "MAE, NMAE and MAPE use replaced rows only. NMAE is the",
+            "N MAE and MAPE use replaced rows only. N MAE is the",
             "equal-weight mean of feature MAEs divided by their training",
-            "standard deviations (ddof=0). Lower is better. NMAE is",
+            "standard deviations (ddof=0). Lower is better. N MAE is",
             "measured in training standard deviations, not percentages.",
-            "Constant training features are excluded from NMAE and",
+            "Constant training features are excluded from N MAE and",
             "reported separately. MAPE excludes zero original values.",
             *([constraint_note] if constraint_note else []),
             "",
@@ -237,10 +256,95 @@ def export_overall_comparison(
     return _OVERALL_COMPARISON_PATH
 
 
+def export_feature_evaluation(
+    config: LoadedConfig, metrics: Mapping[str, Any]
+) -> str:
+    """Write saved replaced-row metrics at the configured feature granularity."""
+    model_name = config.model_config["name"]
+    if "n_clusters" not in metrics:
+        raise ValueError("Feature evaluation metrics are missing n_clusters")
+    method = "{} (k={})".format(model_name, metrics["n_clusters"])
+    scenarios = metrics.get("scenarios", {})
+    feature_stds = (
+        metrics.get("training_feature_scales", {}).get("feature_stds", {})
+    )
+    rows = []
+    missing_per_feature_metrics = False
+    for percent in nonconsent.scenario_percentages(config):
+        scenario_name = "{}_{}".format(config["nonconsent"]["prefix"], percent)
+        scenario = scenarios.get(scenario_name, {})
+        per_feature_mae = scenario.get("per_feature_replaced_rows_mae")
+        per_feature_mape = scenario.get("per_feature_replaced_rows_mape")
+        per_feature_nmae = scenario.get("per_feature_replaced_rows_nmae")
+        valid_cells = scenario.get("per_feature_replaced_rows_mape_valid_cells")
+        excluded_zero_cells = scenario.get(
+            "per_feature_replaced_rows_mape_excluded_zero_cells"
+        )
+        if not all(
+            isinstance(value, Mapping)
+            for value in (
+                per_feature_mae,
+                per_feature_mape,
+                per_feature_nmae,
+                valid_cells,
+                excluded_zero_cells,
+            )
+        ):
+            missing_per_feature_metrics = True
+        per_feature_mae = per_feature_mae or {}
+        per_feature_mape = per_feature_mape or {}
+        per_feature_nmae = per_feature_nmae or {}
+        valid_cells = valid_cells or {}
+        excluded_zero_cells = excluded_zero_cells or {}
+        for feature in config["features"]:
+            feature_name = feature["name"]
+            values = [
+                method,
+                str(percent),
+                feature_name,
+                _markdown_number(scenario.get("n_replaced")),
+                _markdown_number(per_feature_mae.get(feature_name)),
+                _markdown_number(per_feature_mape.get(feature_name)),
+                _markdown_number(per_feature_nmae.get(feature_name)),
+                _markdown_number(feature_stds.get(feature_name)),
+                _markdown_number(valid_cells.get(feature_name)),
+                _markdown_number(excluded_zero_cells.get(feature_name)),
+            ]
+            rows.append("| {} |".format(" | ".join(values)))
+    content = [
+        "### Feature-level evaluation",
+        "",
+        "| Method | NC (%) | Feature | Replaced rows | MAE | MAPE (%) | N MAE | Training SD | MAPE valid cells | MAPE excluded zero cells |",
+        "|--------|--------|---------|---------------|-----|----------|-------|-------------|------------------|--------------------------|",
+        *rows,
+        "",
+        "All feature metrics use replaced rows only.",
+        "Lower MAE, MAPE and N MAE are better.",
+        "MAE uses original feature units.",
+        "MAPE excludes zero original values.",
+        "N MAE uses training SD (ddof=0) and is not a percentage.",
+        "Constant training features are excluded from N MAE.",
+    ]
+    if missing_per_feature_metrics:
+        content.append(
+            "Some saved results lack per-feature metrics; those values are "
+            "unavailable (—) because the results predate per-feature evaluation."
+        )
+    content.append("")
+    storage.write_text(
+        config,
+        _FEATURE_EVALUATION_PATH,
+        "\n".join(content),
+        overwrite_existing=True,
+    )
+    return _FEATURE_EVALUATION_PATH
+
+
 def export_multi_model_comparisons(
     config: LoadedConfig,
     overall_reports: List[str],
     cluster_selection_reports: List[str],
+    feature_reports: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     """Combine the per-model Markdown tables produced during this run."""
     outputs = {}
@@ -270,7 +374,64 @@ def export_multi_model_comparisons(
             overwrite_existing=True,
         )
         outputs["cluster_selection_comparison"] = _CLUSTER_SELECTION_COMPARISON_PATH
+    if feature_reports:
+        content = _merge_model_markdown_tables(
+            feature_reports,
+            "| Method | NC (%) | Feature |",
+            "### Feature-level evaluation",
+        )
+        storage.write_text(
+            config,
+            _FEATURE_EVALUATION_PATH,
+            content,
+            overwrite_existing=True,
+        )
+        outputs["feature_evaluation"] = _FEATURE_EVALUATION_PATH
     return outputs
+
+
+def export_saved_evaluation_reports(config: LoadedConfig) -> Dict[str, str]:
+    """Regenerate comparison reports from saved per-model metrics without fitting."""
+    overall_reports = []
+    feature_reports = []
+    cluster_selection_reports = []
+    for model_name in config.models_run:
+        model_config = config.for_model(model_name)
+        selected_k = storage.selected_candidate(model_config)
+        metrics_path = (
+            "metrics/{}/k_{}/results.json".format(model_name, selected_k)
+            if selected_k is not None
+            else "metrics/results.json"
+        )
+        metrics = storage.read_json(model_config, metrics_path)
+        overall_path = export_overall_comparison(model_config, metrics)
+        feature_path = export_feature_evaluation(model_config, metrics)
+        overall_reports.append(
+            (config.artifact_dir / overall_path).read_text(encoding="utf-8")
+        )
+        feature_reports.append(
+            (config.artifact_dir / feature_path).read_text(encoding="utf-8")
+        )
+        if model_config.model_config.get("cluster_search", {}).get("enabled", False):
+            selection_path = export_cluster_selection_comparison(
+                model_config, metrics
+            )
+            cluster_selection_reports.append(
+                (config.artifact_dir / selection_path).read_text(encoding="utf-8")
+            )
+    return export_multi_model_comparisons(
+        config,
+        overall_reports,
+        cluster_selection_reports,
+        feature_reports,
+    )
+
+
+def export_feature_evaluation_from_saved_metrics(
+    config: LoadedConfig, metrics: Mapping[str, Any]
+) -> str:
+    """Public convenience wrapper for regenerating a feature report from metrics."""
+    return export_feature_evaluation(config, metrics)
 
 
 def _merge_model_markdown_tables(

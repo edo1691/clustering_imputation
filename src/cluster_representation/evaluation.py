@@ -493,22 +493,74 @@ def evaluate(
         valid_cell_count = int(valid_mape_cells.sum())
         excluded_zero_cell_count = int(valid_mape_cells.size - valid_cell_count)
         per_feature_replaced_mae: Dict[str, Optional[float]] = {}
+        per_feature_replaced_mae_status: Dict[str, str] = {}
+        per_feature_replaced_mape: Dict[str, Optional[float]] = {}
+        per_feature_replaced_mape_status: Dict[str, str] = {}
+        per_feature_replaced_mape_valid_cells: Dict[str, int] = {}
+        per_feature_replaced_mape_excluded_zero_cells: Dict[str, int] = {}
         per_feature_replaced_nmae: Dict[str, Optional[float]] = {}
+        per_feature_replaced_nmae_status: Dict[str, str] = {}
         included_features = []
         excluded_features = {}
         for index, name in enumerate(feature_names):
             feature_std = float(training_feature_stds[name])
+            feature_original = replaced_original_values[:, index]
+            feature_errors = replaced_absolute_errors[:, index]
+            feature_valid_mape = np.abs(feature_original) != 0
+            feature_valid_count = int(feature_valid_mape.sum())
+            feature_excluded_zero_count = int(
+                feature_valid_mape.size - feature_valid_count
+            )
+            per_feature_replaced_mape_valid_cells[name] = feature_valid_count
+            per_feature_replaced_mape_excluded_zero_cells[name] = (
+                feature_excluded_zero_count
+            )
             feature_mae = (
                 float(replaced_row_errors[:, index].mean())
                 if replaced_mask.any()
                 else None
             )
             per_feature_replaced_mae[name] = feature_mae
-            if feature_std == 0:
+            per_feature_replaced_mae_status[name] = (
+                "available" if replaced_mask.any() else "unavailable_no_replaced_rows"
+            )
+            if not replaced_mask.any():
+                per_feature_replaced_mape[name] = None
+                per_feature_replaced_mape_status[name] = (
+                    "unavailable_no_replaced_rows"
+                )
+            elif feature_valid_count == 0:
+                per_feature_replaced_mape[name] = None
+                per_feature_replaced_mape_status[name] = (
+                    "unavailable_no_nonzero_original_values"
+                )
+            else:
+                feature_mape = float(
+                    100.0
+                    * np.mean(
+                        feature_errors[feature_valid_mape]
+                        / np.abs(feature_original[feature_valid_mape])
+                    )
+                )
+                if not math.isfinite(feature_mape):
+                    raise ValueError(
+                        "Non-finite MAPE for scenario {!r}, feature {!r}".format(
+                            scenario_name, name
+                        )
+                    )
+                per_feature_replaced_mape[name] = feature_mape
+                per_feature_replaced_mape_status[name] = "available"
+            if not replaced_mask.any():
                 per_feature_replaced_nmae[name] = None
+                per_feature_replaced_nmae_status[name] = (
+                    "unavailable_no_replaced_rows"
+                )
+            elif feature_std == 0:
+                per_feature_replaced_nmae[name] = None
+                per_feature_replaced_nmae_status[name] = (
+                    "unavailable_zero_training_standard_deviation"
+                )
                 excluded_features[name] = "zero_training_standard_deviation"
-            elif not replaced_mask.any():
-                per_feature_replaced_nmae[name] = None
             else:
                 normalized_mae = feature_mae / feature_std
                 if not math.isfinite(normalized_mae):
@@ -518,6 +570,7 @@ def evaluate(
                         )
                     )
                 per_feature_replaced_nmae[name] = normalized_mae
+                per_feature_replaced_nmae_status[name] = "available"
                 included_features.append(name)
         if not replaced_mask.any():
             replaced_nmae = None
@@ -561,7 +614,23 @@ def evaluate(
             "overall_test_mae": float(row_errors.mean()),
             "replaced_rows_mae": replaced_mae,
             "per_feature_replaced_rows_mae": per_feature_replaced_mae,
+            "per_feature_replaced_rows_mae_status": (
+                per_feature_replaced_mae_status
+            ),
+            "per_feature_replaced_rows_mape": per_feature_replaced_mape,
+            "per_feature_replaced_rows_mape_status": (
+                per_feature_replaced_mape_status
+            ),
+            "per_feature_replaced_rows_mape_valid_cells": (
+                per_feature_replaced_mape_valid_cells
+            ),
+            "per_feature_replaced_rows_mape_excluded_zero_cells": (
+                per_feature_replaced_mape_excluded_zero_cells
+            ),
             "per_feature_replaced_rows_nmae": per_feature_replaced_nmae,
+            "per_feature_replaced_rows_nmae_status": (
+                per_feature_replaced_nmae_status
+            ),
             "replaced_rows_nmae": replaced_nmae,
             "replaced_rows_nmae_status": replaced_nmae_status,
             "replaced_rows_nmae_included_features": included_features,

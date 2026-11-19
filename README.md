@@ -174,17 +174,31 @@ refitting. The returned notebook table uses readable labels and displays
 unavailable values as `N/A`; the exported files retain machine-readable column
 names and null metric values.
 
-The evaluation stage also writes `tables/overall_comparison.md` in the current
-run directory. It reports the selected constrained K-means candidate and
-configured non-consent scenario; AP and F1 are shown as unavailable because
-they are not calculated by this clustering workflow. The table's time column
-is model fitting time in seconds. Its MAE, NMAE, and MAPE columns use replaced
-rows only. NMAE is the equal-weight mean of per-feature MAEs divided by
-population standard deviations from the imputed original-unit training
-features; constant features are excluded. MAPE excludes cells whose original
-value is zero. The detailed scenario results retain the all-test-row MAE and
-per-feature MAE metrics for compatibility. Shared scales and their imputation
-policy are saved in `preprocessing/training_feature_scales.json`.
+The evaluation stage writes `tables/overall_comparison.md` with one row per
+executed method/model configuration and configured non-consent scenario. AP
+and F1 are shown as unavailable because they are not calculated by this
+clustering workflow. The table's time column is model fitting time in seconds.
+Its `N MAE` and MAPE columns use replaced rows only; raw MAE is retained in
+structured metrics but omitted from this compact comparison. N MAE is the
+equal-weight mean of per-feature MAEs divided by population standard deviations
+from the imputed original-unit training features; constant features are
+excluded. MAPE excludes cells whose original value is zero. The detailed
+scenario results retain the all-test-row MAE and `per_feature_mae` outputs for
+compatibility. Shared scales and their imputation policy are saved in
+`preprocessing/training_feature_scales.json`.
+
+The same evaluation stage writes `tables/feature_evaluation.md`, with one row
+per executed method/model configuration, NC scenario and configured feature.
+It reports replaced-row count, per-feature MAE in original units, MAPE over
+nonzero original values, N MAE (feature MAE divided by shared training SD),
+training SD and MAPE valid/excluded cell counts. Lower MAE, MAPE and N MAE are
+better; N MAE is a training-standard-deviation ratio, not a percentage.
+Per-feature values and statuses are calculated and saved in each scenario's
+structured results, not recomputed by the Markdown renderer. The reports can
+be regenerated from saved metrics with
+`reporting.export_saved_evaluation_reports(config)` without retraining. For
+older results that lack per-feature metrics, the feature table shows em dashes
+and explains that the saved results predate per-feature evaluation.
 
 The evaluation stage also writes `tables/cluster_selection_comparison.md`,
 with one row for each successfully trained cluster-count candidate. It reads

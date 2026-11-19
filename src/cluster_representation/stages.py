@@ -1310,6 +1310,7 @@ def evaluate(config: LoadedConfig) -> StageResult:
     report["model_preprocessing"] = saved_model_metadata.get("preprocessing")
     storage.write_json(config, metrics_path, report)
     comparison_markdown_path = reporting.export_overall_comparison(config, report)
+    feature_evaluation_path = reporting.export_feature_evaluation(config, report)
     cluster_selection_path = reporting.export_cluster_selection_comparison(
         config, report
     )
@@ -1332,7 +1333,12 @@ def evaluate(config: LoadedConfig) -> StageResult:
         config,
         evaluation_stage_key,
         fingerprint,
-        [metrics_path, comparison_markdown_path, cluster_selection_path],
+        [
+            metrics_path,
+            comparison_markdown_path,
+            feature_evaluation_path,
+            cluster_selection_path,
+        ],
         dependencies,
         {"scenario_count": len(scenario_outputs)},
     )
@@ -1341,6 +1347,7 @@ def evaluate(config: LoadedConfig) -> StageResult:
         {
             "metrics": metrics_path,
             "overall_comparison": comparison_markdown_path,
+            "feature_evaluation": feature_evaluation_path,
             "cluster_selection_comparison": cluster_selection_path,
         },
         {

@@ -34,6 +34,8 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     assert scale_metadata["feature_order"] == ["ft_1", "ft_2", "ft_3"]
     comparison_path = root / "tables/overall_comparison.md"
     assert comparison_path.is_file()
+    feature_report_path = root / "tables/feature_evaluation.md"
+    assert feature_report_path.is_file()
     transformed = pd.read_parquet(
         root
         / "models/constrained_kmeans/transformed/gdpr_20/transformed_test.parquet"
@@ -59,6 +61,13 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     )
     assert "overall_test_mae" in metrics["scenarios"]["gdpr_20"]
     assert "per_feature_mae" in metrics["scenarios"]["gdpr_20"]
+    feature_scenario = metrics["scenarios"]["gdpr_20"]
+    assert "per_feature_replaced_rows_mae" in feature_scenario
+    assert "per_feature_replaced_rows_mape" in feature_scenario
+    assert "per_feature_replaced_rows_nmae" in feature_scenario
+    assert "per_feature_replaced_rows_mape_status" in feature_scenario
+    assert "per_feature_replaced_rows_mape_valid_cells" in feature_scenario
+    assert "per_feature_replaced_rows_mape_excluded_zero_cells" in feature_scenario
     assert "Replaced-row MAPE excludes cells with zero original values" in metrics[
         "notes"
     ][2]
@@ -73,9 +82,12 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     markdown = comparison_path.read_text(encoding="utf-8")
     assert markdown.startswith("### Overall comparison of evaluated methods\n\n")
     assert (
-        "| Method | NC (%) | AP | F1 | MAE | NMAE (train SD) ↓ | MAPE (%) | \\|G\\| | k̄ | Time (s) |"
+        "| Method | NC (%) | AP | F1 | N MAE | MAPE (%) | \\|G\\| | k̄ | Time (s) |"
         in markdown
     )
+    assert "MAE" not in [
+        cell.strip() for cell in markdown.splitlines()[2].strip("|").split("|")
+    ]
     table_rows = [
         line
         for line in markdown.splitlines()
@@ -93,29 +105,23 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
             "—",
             "—",
         ]
-        if scenario["replaced_rows_mae"] is None:
+        if scenario["replaced_rows_nmae"] is None:
             assert cells[4] == "—"
         else:
             assert float(cells[4]) == pytest.approx(
-                scenario["replaced_rows_mae"]
-            )
-        if scenario["replaced_rows_nmae"] is None:
-            assert cells[5] == "—"
-        else:
-            assert float(cells[5]) == pytest.approx(
                 scenario["replaced_rows_nmae"]
             )
         if scenario["replaced_rows_mape"] is None:
-            assert cells[6] == "—"
+            assert cells[5] == "—"
         else:
-            assert float(cells[6]) == pytest.approx(scenario["replaced_rows_mape"])
-        assert cells[7:] == [
+            assert float(cells[5]) == pytest.approx(scenario["replaced_rows_mape"])
+        assert cells[6:] == [
             "3",
             str(int(metrics["average_training_cluster_size"])),
             str(metrics["timings_seconds"]["fitting"]),
         ]
-    assert "MAE, NMAE and MAPE use replaced rows only." in markdown
-    assert "Constant training features are excluded from NMAE and" in markdown
+    assert "N MAE and MAPE use replaced rows only." in markdown
+    assert "Constant training features are excluded from N MAE and" in markdown
     assert "reported separately. MAPE excludes zero original values." in markdown
     assert "Baseline" not in markdown
     assert "CC |" not in markdown
@@ -129,6 +135,71 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     assert (root / "metrics/combined_evaluation.csv").is_file()
     assert (root / "metrics/combined_evaluation.parquet").is_file()
     assert not (root / "models/spectral_coclustering").exists()
+
+    feature_markdown = feature_report_path.read_text(encoding="utf-8")
+    feature_rows = [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in feature_markdown.splitlines()
+        if line.startswith("|")
+        and not line.startswith("| Method")
+        and not line.startswith("|--------")
+    ]
+    assert len(feature_rows) == 6 * len(small_config["features"])
+    assert [
+        (int(row[1]), row[2])
+        for row in feature_rows
+    ] == [
+        (percent, feature["name"])
+        for percent in (0, 20, 40, 60, 80, 100)
+        for feature in small_config["features"]
+    ]
+    for row in feature_rows:
+        percent, feature_name = int(row[1]), row[2]
+        scenario = metrics["scenarios"]["gdpr_{}".format(percent)]
+        assert row[3] == str(scenario["n_replaced"])
+        feature_mae = scenario["per_feature_replaced_rows_mae"][feature_name]
+        feature_mape = scenario["per_feature_replaced_rows_mape"][feature_name]
+        feature_nmae = scenario["per_feature_replaced_rows_nmae"][feature_name]
+        assert (
+            row[4] == "—"
+            if feature_mae is None
+            else float(row[4]) == pytest.approx(feature_mae)
+        )
+        assert (
+            row[5] == "—"
+            if feature_mape is None
+            else float(row[5]) == pytest.approx(feature_mape)
+        )
+        assert (
+            row[6] == "—"
+            if feature_nmae is None
+            else float(row[6]) == pytest.approx(feature_nmae)
+        )
+        assert float(row[7]) == pytest.approx(
+            scale_metadata["feature_scales"][feature_name]
+        )
+        assert int(row[8]) == scenario[
+            "per_feature_replaced_rows_mape_valid_cells"
+        ][feature_name]
+        assert int(row[9]) == scenario[
+            "per_feature_replaced_rows_mape_excluded_zero_cells"
+        ][feature_name]
+    scenario = metrics["scenarios"]["gdpr_20"]
+    eligible_nmaes = [
+        scenario["per_feature_replaced_rows_nmae"][feature["name"]]
+        for feature in small_config["features"]
+        if scenario["per_feature_replaced_rows_nmae"][feature["name"]] is not None
+    ]
+    assert scenario["replaced_rows_nmae"] == pytest.approx(
+        np.mean(eligible_nmaes)
+    )
+    weighted_feature_mape = sum(
+        scenario["per_feature_replaced_rows_mape"][feature["name"]]
+        * scenario["per_feature_replaced_rows_mape_valid_cells"][feature["name"]]
+        for feature in small_config["features"]
+        if scenario["per_feature_replaced_rows_mape"][feature["name"]] is not None
+    ) / scenario["replaced_rows_mape_valid_cells"]
+    assert scenario["replaced_rows_mape"] == pytest.approx(weighted_feature_mape)
 
 
 def test_overall_comparison_uses_configured_range(small_config_path):
@@ -159,15 +230,14 @@ def test_overall_comparison_uses_configured_range(small_config_path):
     for row in rows:
         scenario = metrics["scenarios"]["gdpr_{}".format(row[1])]
         assert row[0] == "constrained_kmeans (k=3)"
-        assert float(row[4]) == pytest.approx(scenario["replaced_rows_mae"])
         if scenario["replaced_rows_nmae"] is None:
+            assert row[4] == "—"
+        else:
+            assert float(row[4]) == pytest.approx(scenario["replaced_rows_nmae"])
+        if scenario["replaced_rows_mape"] is None:
             assert row[5] == "—"
         else:
-            assert float(row[5]) == pytest.approx(scenario["replaced_rows_nmae"])
-        if scenario["replaced_rows_mape"] is None:
-            assert row[6] == "—"
-        else:
-            assert float(row[6]) == pytest.approx(scenario["replaced_rows_mape"])
+            assert float(row[5]) == pytest.approx(scenario["replaced_rows_mape"])
 
     indicators = storage.read_frame(config, "data/nonconsent.parquet")
     assert indicators[["gdpr_10", "gdpr_20", "gdpr_30"]].sum().tolist() == [
@@ -196,12 +266,18 @@ def test_combined_report_aligns_scenarios_and_reuses_fitted_candidates(
     )
     comparison = pd.read_parquet(root / train_result.artifacts["comparison"])
     successful = comparison.loc[comparison["status"].eq("success")]
+    assert evaluation_result.artifacts["feature_evaluation"] == (
+        "tables/feature_evaluation.md"
+    )
 
     def fail_if_fit(*args, **kwargs):
         raise AssertionError("Reporting must not fit or retrain models")
 
     monkeypatch.setattr(ConstrainedKMeans, "fit", fail_if_fit)
     display = reporting.combined_evaluation_report(small_search_config)
+    regenerated = reporting.export_saved_evaluation_reports(small_search_config)
+    assert regenerated["feature_evaluation"] == "tables/feature_evaluation.md"
+    assert (root / regenerated["feature_evaluation"]).is_file()
 
     exported = pd.read_parquet(root / "metrics/combined_evaluation.parquet")
     exported_csv = pd.read_csv(root / "metrics/combined_evaluation.csv")
@@ -892,7 +968,7 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
         for line, scenario_name in zip(model_rows, scenario_names):
             cells = [cell.strip() for cell in line.strip("|").split("|")]
             nmae = model_metrics["scenarios"][scenario_name]["replaced_rows_nmae"]
-            assert cells[5] == ("—" if nmae is None else str(nmae))
+            assert cells[4] == ("—" if nmae is None else str(nmae))
     cluster_report = (
         root / "tables/cluster_selection_comparison.md"
     ).read_text(encoding="utf-8")
@@ -905,6 +981,63 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
         for line in cluster_report.splitlines()
     )
     assert "Selection mode: auto." in cluster_report
+    feature_markdown = (
+        root / "tables/feature_evaluation.md"
+    ).read_text(encoding="utf-8")
+    feature_rows = [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in feature_markdown.splitlines()
+        if line.startswith("|")
+        and not line.startswith("| Method")
+        and not line.startswith("|--------")
+    ]
+    assert len(feature_rows) == 2 * len(scenario_names) * len(config["features"])
+    expected_order = [
+        (model_name, scenario_name, feature["name"])
+        for model_name in ("constrained_kmeans", "spectral_coclustering")
+        for scenario_name in scenario_names
+        for feature in config["features"]
+    ]
+    assert [
+        (row[0].split(" ")[0], "gdpr_{}".format(row[1]), row[2])
+        for row in feature_rows
+    ] == expected_order
+    for row in feature_rows:
+        model_name, scenario_name, feature_name = (
+            row[0].split(" ")[0],
+            "gdpr_{}".format(row[1]),
+            row[2],
+        )
+        selected_k = storage.selected_candidate(config.for_model(model_name))
+        model_metrics = json.loads(
+            (
+                root
+                / "metrics/{}/k_{}/results.json".format(model_name, selected_k)
+            ).read_text(encoding="utf-8")
+        )
+        scenario = model_metrics["scenarios"][scenario_name]
+        per_feature_mae = scenario["per_feature_replaced_rows_mae"][feature_name]
+        per_feature_nmae = scenario["per_feature_replaced_rows_nmae"][feature_name]
+        per_feature_mape = scenario["per_feature_replaced_rows_mape"][feature_name]
+        std = saved_scales["feature_scales"][feature_name]
+        assert (
+            row[4] == "—"
+            if per_feature_mae is None
+            else float(row[4]) == pytest.approx(per_feature_mae)
+        )
+        assert (
+            row[5] == "—"
+            if per_feature_mape is None
+            else float(row[5]) == pytest.approx(per_feature_mape)
+        )
+        assert (
+            row[6] == "—"
+            if per_feature_nmae is None
+            else float(row[6]) == pytest.approx(per_feature_nmae)
+        )
+        assert float(row[7]) == pytest.approx(std)
+        if per_feature_mae is not None and std > 0:
+            assert per_feature_nmae == pytest.approx(per_feature_mae / std)
 
 
 def test_transform_stage_processes_every_scenario_from_original_test_rows(small_config):
@@ -1291,6 +1424,26 @@ def test_replaced_row_mae_and_mape_exclude_nonreplaced_rows(small_config):
     assert result["replaced_rows_mape_status"] == "available"
     assert result["replaced_rows_mape_valid_cells"] == 2
     assert result["replaced_rows_mape_excluded_zero_cells"] == 1
+    assert result["per_feature_replaced_rows_mape"] == {
+        "ft_1": pytest.approx(20.0),
+        "ft_2": pytest.approx(20.0),
+        "ft_3": None,
+    }
+    assert result["per_feature_replaced_rows_mape_status"] == {
+        "ft_1": "available",
+        "ft_2": "available",
+        "ft_3": "unavailable_no_nonzero_original_values",
+    }
+    assert result["per_feature_replaced_rows_mape_valid_cells"] == {
+        "ft_1": 1,
+        "ft_2": 1,
+        "ft_3": 0,
+    }
+    assert result["per_feature_replaced_rows_mape_excluded_zero_cells"] == {
+        "ft_1": 0,
+        "ft_2": 0,
+        "ft_3": 1,
+    }
 
     changed_nonreplaced = transformed.copy()
     changed_nonreplaced.loc[1, ["ft_1", "ft_2", "ft_3"]] = [

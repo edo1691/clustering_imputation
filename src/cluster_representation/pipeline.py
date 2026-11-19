@@ -32,6 +32,7 @@ def run(config: LoadedConfig) -> List[stages.StageResult]:
 
     overall_reports = []
     cluster_selection_reports = []
+    feature_reports = []
     for model_name in config.models_run:
         model_config = config.for_model(model_name)
         for step in steps:
@@ -56,7 +57,14 @@ def run(config: LoadedConfig) -> List[stages.StageResult]:
                             encoding="utf-8"
                         )
                     )
+                feature_path = result.artifacts.get("feature_evaluation")
+                if feature_path:
+                    feature_reports.append(
+                        (config.artifact_dir / feature_path).read_text(
+                            encoding="utf-8"
+                        )
+                    )
     reporting.export_multi_model_comparisons(
-        config, overall_reports, cluster_selection_reports
+        config, overall_reports, cluster_selection_reports, feature_reports
     )
     return results
