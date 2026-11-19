@@ -6,6 +6,15 @@ from .base import ClusterModel
 from .constrained_kmeans import ConstrainedKMeans
 from .constrained_coclustering import ConstrainedCoclustering
 from .robust_constrained_coclustering import RobustConstrainedCoclustering
+from .spectral_coclustering import SpectralCoclusteringModel
+
+
+MODEL_NAMES = (
+    "constrained_kmeans",
+    "constrained_coclustering",
+    "robust_constrained_coclustering",
+    "spectral_coclustering",
+)
 
 
 def create_model(model_config: Dict[str, Any]) -> ClusterModel:
@@ -14,6 +23,8 @@ def create_model(model_config: Dict[str, Any]) -> ClusterModel:
         return ConstrainedKMeans(
             model_config["parameters"], model_config["constraints"]
         )
+    if name == "spectral_coclustering":
+        return SpectralCoclusteringModel(model_config["parameters"])
     if name == "constrained_coclustering":
         return ConstrainedCoclustering(
             model_config["parameters"], model_config["constraints"]

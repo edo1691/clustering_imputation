@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Set
 
 import yaml
 
+from .models.registry import MODEL_NAMES
+
 
 PIPELINE_STEPS = (
     "generate_dataset",
@@ -54,11 +56,32 @@ class LoadedConfig(dict):
         source_path: Path,
         model_config: Dict[str, Any],
         model_config_path: Path,
+        models_run: Optional[list] = None,
+        model_configs: Optional[Dict[str, Dict[str, Any]]] = None,
+        model_config_paths: Optional[Dict[str, Path]] = None,
     ) -> None:
         super().__init__(settings)
         self.source_path = source_path
         self.model_config = model_config
         self.model_config_path = model_config_path
+        self.models_run = list(models_run or [model_config["name"]])
+        self.model_configs = dict(model_configs or {model_config["name"]: model_config})
+        self.model_config_paths = dict(
+            model_config_paths or {model_config["name"]: model_config_path}
+        )
+
+    def for_model(self, name: str) -> "LoadedConfig":
+        if name not in self.models_run:
+            raise KeyError("Model {!r} is not selected in models.run".format(name))
+        return LoadedConfig(
+            copy.deepcopy(dict(self)),
+            self.source_path,
+            copy.deepcopy(self.model_configs[name]),
+            self.model_config_paths[name],
+            self.models_run,
+            self.model_configs,
+            self.model_config_paths,
+        )
 
     @property
     def artifact_dir(self) -> Path:
@@ -67,8 +90,10 @@ class LoadedConfig(dict):
     @property
     def fingerprint(self) -> str:
         serializable = copy.deepcopy(dict(self))
-        serializable["model"]["config_path"] = str(self.model_config_path)
-        serializable["resolved_model_config"] = self.model_config
+        serializable["models"]["configs"] = {
+            name: str(path) for name, path in self.model_config_paths.items()
+        }
+        serializable["resolved_model_configs"] = self.model_configs
         payload = json.dumps(serializable, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -187,6 +212,81 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
         raise ConfigurationError("Cannot read model config {}: {}".format(path, exc))
     _mapping(model, "model configuration")
     name = model.get("name")
+    if name == "spectral_coclustering":
+        _keys(
+            model,
+            {"name", "parameters", "cluster_search"},
+            "model configuration",
+        )
+        _require(model, {"name", "parameters", "cluster_search"}, "model configuration")
+        parameters = _mapping(model["parameters"], "model.parameters")
+        _keys(parameters, {"n_clusters", "random_state", "n_init"}, "model.parameters")
+        _require(parameters, {"random_state", "n_init"}, "model.parameters")
+        _integer(parameters["random_state"], "model.parameters.random_state", 0)
+        _integer(parameters["n_init"], "model.parameters.n_init", 1)
+
+        search = _mapping(model["cluster_search"], "model.cluster_search")
+        _keys(
+            search,
+            {"enabled", "candidates", "selected_n_clusters"},
+            "model.cluster_search",
+        )
+        _require(
+            search,
+            {"enabled", "candidates", "selected_n_clusters"},
+            "model.cluster_search",
+        )
+        if not isinstance(search["enabled"], bool):
+            raise ConfigurationError("model.cluster_search.enabled must be boolean")
+        candidates = search["candidates"]
+        if not isinstance(candidates, list) or not candidates:
+            raise ConfigurationError(
+                "model.cluster_search.candidates must be a non-empty list"
+            )
+        for index, candidate in enumerate(candidates):
+            _integer(
+                candidate,
+                "model.cluster_search.candidates[{}]".format(index),
+                2,
+            )
+        if len(set(candidates)) != len(candidates):
+            raise ConfigurationError(
+                "model.cluster_search.candidates must contain unique values"
+            )
+        configured_selection = search["selected_n_clusters"]
+        if configured_selection == "auto":
+            if not search["enabled"]:
+                raise ConfigurationError(
+                    "model.cluster_search.selected_n_clusters='auto' requires "
+                    "cluster_search.enabled=true"
+                )
+            selected = "auto"
+        else:
+            selected = _integer(
+                configured_selection,
+                "model.cluster_search.selected_n_clusters",
+                2,
+            )
+            if selected not in candidates:
+                raise ConfigurationError(
+                    "model.cluster_search.selected_n_clusters must be a candidate"
+                )
+        if "n_clusters" in parameters:
+            configured_n_clusters = _integer(
+                parameters["n_clusters"], "model.parameters.n_clusters", 2
+            )
+            if search["enabled"]:
+                raise ConfigurationError(
+                    "model.parameters.n_clusters must be omitted when cluster search is enabled"
+                )
+            if configured_n_clusters != selected:
+                raise ConfigurationError(
+                    "model.parameters.n_clusters must match selected_n_clusters "
+                    "when cluster search is disabled"
+                )
+        if not search["enabled"] and "n_clusters" not in parameters:
+            parameters["n_clusters"] = selected
+        return model
     if name == "constrained_kmeans":
         allowed_model_keys = {"name", "parameters", "constraints", "cluster_search"}
         _keys(model, allowed_model_keys, "model configuration")
@@ -240,15 +340,24 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
                 raise ConfigurationError(
                     "model.cluster_search.candidates must contain unique values"
                 )
-            selected = _integer(
-                search["selected_n_clusters"],
-                "model.cluster_search.selected_n_clusters",
-                1,
-            )
-            if selected not in candidates:
-                raise ConfigurationError(
-                    "model.cluster_search.selected_n_clusters must be a candidate"
+            configured_selection = search["selected_n_clusters"]
+            if configured_selection == "auto":
+                if not search["enabled"]:
+                    raise ConfigurationError(
+                        "model.cluster_search.selected_n_clusters='auto' requires "
+                        "cluster_search.enabled=true"
+                    )
+                selected = "auto"
+            else:
+                selected = _integer(
+                    configured_selection,
+                    "model.cluster_search.selected_n_clusters",
+                    1,
                 )
+                if selected not in candidates:
+                    raise ConfigurationError(
+                        "model.cluster_search.selected_n_clusters must be a candidate"
+                    )
             if "n_clusters" in parameters:
                 configured_n_clusters = _integer(
                     parameters["n_clusters"], "model.parameters.n_clusters", 1
@@ -256,6 +365,11 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
                 if search["enabled"]:
                     raise ConfigurationError(
                         "model.parameters.n_clusters must be omitted when cluster search is enabled"
+                    )
+                if selected == "auto":
+                    raise ConfigurationError(
+                        "model.parameters.n_clusters must be omitted when "
+                        "selected_n_clusters='auto'"
                     )
                 if configured_n_clusters != selected:
                     raise ConfigurationError(
@@ -330,7 +444,7 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
         "nonconsent",
         "split",
         "preprocessing",
-        "model",
+        "models",
         "prototypes",
         "transformation",
         "evaluation",
@@ -411,28 +525,67 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
     }:
         raise ConfigurationError("preprocessing.scaling must be 'standard' or 'none'")
 
-    model = _mapping(root["model"], "model")
-    _keys(model, {"config_path"}, "model")
-    _require(model, {"config_path"}, "model")
-    model_path_value = model["config_path"]
-    if not isinstance(model_path_value, str) or not model_path_value:
-        raise ConfigurationError("model.config_path must be a non-empty path")
-    model_path = (source_path.parent / model_path_value).resolve()
-    model_config = _validate_model_config(model_path)
-    if model_config["name"] == "constrained_kmeans" and "cluster_search" not in model_config:
-        params = model_config["parameters"]
-        minimum = model_config["constraints"]["min_cluster_size"]
-        if params["n_clusters"] * minimum > n_rows - n_test:
-            raise ConfigurationError(
-                "n_clusters * min_cluster_size exceeds the expected training row count"
+    models = _mapping(root["models"], "models")
+    _keys(models, {"run", "configs"}, "models")
+    _require(models, {"run", "configs"}, "models")
+    models_run = models["run"]
+    if not isinstance(models_run, list) or not models_run:
+        raise ConfigurationError("models.run must contain at least one model name")
+    if any(not isinstance(name, str) for name in models_run):
+        raise ConfigurationError("models.run entries must be model names")
+    unknown_models = sorted(set(models_run) - set(MODEL_NAMES))
+    if unknown_models:
+        raise ConfigurationError(
+            "Unknown model name(s) in models.run: {}. Valid model names: {}".format(
+                ", ".join(unknown_models), ", ".join(MODEL_NAMES)
             )
-    elif model_config["name"] != "constrained_kmeans":
-        params = model_config["parameters"]
-        minimum = model_config["constraints"]["min_row_cluster_size"]
-        if params["n_row_clusters"] * minimum > n_rows - n_test:
+        )
+    if len(set(models_run)) != len(models_run):
+        raise ConfigurationError("models.run must not contain duplicate model names")
+    model_paths_config = _mapping(models["configs"], "models.configs")
+    _keys(model_paths_config, set(MODEL_NAMES), "models.configs")
+    model_configs: Dict[str, Dict[str, Any]] = {}
+    model_config_paths: Dict[str, Path] = {}
+    for model_name in models_run:
+        if model_name not in model_paths_config:
             raise ConfigurationError(
-                "n_row_clusters * min_row_cluster_size exceeds the expected training row count"
+                "models.configs is missing selected model {!r}".format(model_name)
             )
+        path_value = model_paths_config[model_name]
+        if not isinstance(path_value, str) or not path_value:
+            raise ConfigurationError(
+                "models.configs.{} must be a non-empty path".format(model_name)
+            )
+        model_path = (source_path.parent / path_value).resolve()
+        model_config = _validate_model_config(model_path)
+        if model_config["name"] != model_name:
+            raise ConfigurationError(
+                "Model config {} names {!r}, but models.run selected {!r}".format(
+                    model_path, model_config["name"], model_name
+                )
+            )
+        if model_name == "constrained_kmeans" and "cluster_search" not in model_config:
+            params = model_config["parameters"]
+            minimum = model_config["constraints"]["min_cluster_size"]
+            if params["n_clusters"] * minimum > n_rows - n_test:
+                raise ConfigurationError(
+                    "n_clusters * min_cluster_size exceeds the expected training row count"
+                )
+        elif model_name in {
+            "constrained_coclustering",
+            "robust_constrained_coclustering",
+        }:
+            params = model_config["parameters"]
+            minimum = model_config["constraints"]["min_row_cluster_size"]
+            if params["n_row_clusters"] * minimum > n_rows - n_test:
+                raise ConfigurationError(
+                    "n_row_clusters * min_row_cluster_size exceeds the expected training row count"
+                )
+        model_configs[model_name] = model_config
+        model_config_paths[model_name] = model_path
+    active_model_name = models_run[0]
+    model_config = model_configs[active_model_name]
+    model_path = model_config_paths[active_model_name]
 
     prototypes = _mapping(root["prototypes"], "prototypes")
     _keys(prototypes, {"aggregation"}, "prototypes")
@@ -501,9 +654,19 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
         raise ConfigurationError("output.overwrite must be boolean")
 
     normalized = copy.deepcopy(dict(root))
-    normalized["model"]["config_path"] = str(model_path)
+    normalized["models"]["configs"] = {
+        name: str(model_config_paths[name]) for name in models_run
+    }
     normalized["output"]["root"] = str((source_path.parent / output["root"]).resolve())
-    return LoadedConfig(normalized, source_path, model_config, model_path)
+    return LoadedConfig(
+        normalized,
+        source_path,
+        model_config,
+        model_path,
+        models_run,
+        model_configs,
+        model_config_paths,
+    )
 
 
 def load_config(path: Any) -> LoadedConfig:

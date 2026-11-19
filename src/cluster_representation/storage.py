@@ -49,7 +49,8 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
     elif stage == "train_model":
         model_settings = config.model_config
         if (
-            model_settings["name"] == "constrained_kmeans"
+            model_settings["name"]
+            in {"constrained_kmeans", "spectral_coclustering"}
             and model_settings.get("cluster_search", {}).get("enabled", False)
         ):
             model_settings = {
@@ -59,8 +60,9 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
                     for key, value in model_settings["parameters"].items()
                     if key != "n_clusters"
                 },
-                "constraints": model_settings["constraints"],
             }
+            if "constraints" in config.model_config:
+                model_settings["constraints"] = config.model_config["constraints"]
         settings = {
             "preprocessor": stage_fingerprint(config, "fit_preprocessor"),
             "model": model_settings,
@@ -101,11 +103,43 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
 def selected_candidate(config: LoadedConfig) -> Optional[int]:
     search = config.model_config.get("cluster_search")
     if (
-        config.model_config["name"] == "constrained_kmeans"
+        config.model_config["name"]
+        in {"constrained_kmeans", "spectral_coclustering"}
         and search
         and search["enabled"]
     ):
-        return int(search["selected_n_clusters"])
+        selection_path = selection_artifact_path(config)
+        if not artifact_path(config, selection_path).is_file():
+            configured_k = search["selected_n_clusters"]
+            if isinstance(configured_k, int) and not isinstance(configured_k, bool):
+                try:
+                    candidate = require_stage(
+                        config,
+                        candidate_stage_key(
+                            "train_model",
+                            configured_k,
+                            config.model_config["name"],
+                        ),
+                        candidate_training_fingerprint(config, configured_k),
+                        [],
+                    ).get("metadata", {})
+                except FileNotFoundError:
+                    candidate = {}
+                if candidate.get("status") not in (None, "success"):
+                    raise ValueError(
+                        "Selected cluster count {} was not successfully trained "
+                        "(status {}: {}).".format(
+                            configured_k,
+                            candidate.get("status"),
+                            candidate.get("failure_reason") or "no failure reason recorded",
+                        )
+                    )
+            raise FileNotFoundError(
+                "Cluster selection has not been resolved; run train_model first "
+                "for configured selection {!r}.".format(configured_k)
+            )
+        selection = read_json(config, selection_path)
+        return int(selection["selected_n_clusters"])
     return None
 
 
@@ -119,7 +153,7 @@ def candidate_training_fingerprint(config: LoadedConfig, n_clusters: int) -> str
             for key, value in model["parameters"].items()
             if key not in {"n_clusters", "cluster_search"}
         },
-        "constraints": model["constraints"],
+        "constraints": model.get("constraints", "not_applicable"),
         "n_clusters": n_clusters,
     }
     return _fingerprint(settings)
@@ -134,8 +168,10 @@ def candidate_prototype_fingerprint(config: LoadedConfig, n_clusters: int) -> st
     )
 
 
-def candidate_stage_key(stage: str, n_clusters: int) -> str:
-    return "{}:constrained_kmeans:k_{}".format(stage, n_clusters)
+def candidate_stage_key(
+    stage: str, n_clusters: int, model_name: str = "constrained_kmeans"
+) -> str:
+    return "{}:{}:k_{}".format(stage, model_name, n_clusters)
 
 
 def cluster_search_fingerprint(config: LoadedConfig) -> str:
@@ -147,6 +183,28 @@ def cluster_search_fingerprint(config: LoadedConfig) -> str:
             "model": stage_fingerprint(config, "train_model"),
             "candidates": search["candidates"],
         }
+    )
+
+
+def selection_fingerprint(config: LoadedConfig) -> str:
+    search = config.model_config.get("cluster_search")
+    if not search or not search.get("enabled"):
+        raise ValueError("Cluster selection artifacts require enabled cluster search")
+    return _fingerprint(
+        {
+            "cluster_search": cluster_search_fingerprint(config),
+            "configured_selected_n_clusters": search["selected_n_clusters"],
+        }
+    )
+
+
+def selection_stage_key(config: LoadedConfig) -> str:
+    return "select_model:{}".format(selection_fingerprint(config)[:12])
+
+
+def selection_artifact_path(config: LoadedConfig) -> str:
+    return "models/{}/selection_{}.json".format(
+        config.model_config["name"], selection_fingerprint(config)[:12]
     )
 
 
@@ -290,6 +348,19 @@ def write_csv(
     return target
 
 
+def write_text(
+    config: LoadedConfig,
+    relative: str,
+    content: str,
+    overwrite_existing: bool = False,
+) -> Path:
+    target = artifact_path(config, relative)
+    _prepare_target(config, target, allow_existing=overwrite_existing)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(target, content)
+    return target
+
+
 def read_frame(config: LoadedConfig, relative: str) -> pandas.DataFrame:
     target = artifact_path(config, relative)
     if not target.is_file():
@@ -388,7 +459,8 @@ def _atomic_write(target: Path, content: str) -> None:
 
 def _serializable_config(config: LoadedConfig) -> Dict[str, Any]:
     settings = json.loads(json.dumps(dict(config), default=str))
-    settings["resolved_model_config"] = config.model_config
+    settings["resolved_model_configs"] = config.model_configs
+    settings["models"]["run"] = list(config.models_run)
     return settings
 
 

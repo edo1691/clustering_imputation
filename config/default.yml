@@ -49,8 +49,13 @@ preprocessing:
   imputation: median
   scaling: standard
 
-model:
-  config_path: models/constrained_kmeans.yml
+models:
+  run:
+    - constrained_kmeans
+    - spectral_coclustering
+  configs:
+    constrained_kmeans: models/constrained_kmeans.yml
+    spectral_coclustering: models/spectral_coclustering.yml
 
 prototypes:
   aggregation: median

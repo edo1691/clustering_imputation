@@ -4,6 +4,9 @@ import pytest
 
 from cluster_representation.models import create_model
 from cluster_representation.models.constrained_kmeans import ConstrainedKMeans
+from cluster_representation.models.spectral_coclustering import (
+    SpectralCoclusteringModel,
+)
 from cluster_representation.prototypes import build_prototypes
 from cluster_representation.transformation import transform_test
 
@@ -32,6 +35,54 @@ def test_constrained_kmeans_rejects_infeasible_minimum(small_config):
     model = create_model(config)
     with pytest.raises(ValueError, match="Infeasible"):
         model.fit(np.ones((90, 2)))
+
+
+def test_spectral_coclustering_handles_zero_rows_columns_and_persists_assignment(
+    tmp_path,
+):
+    values = np.array(
+        [
+            [1.0, 0.0, 2.0, 0.0],
+            [2.0, 0.0, 1.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.8, 0.0, 1.8, 0.0],
+            [0.0, 1.5, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    model = SpectralCoclusteringModel(
+        {"n_clusters": 2, "random_state": 123, "n_init": 3}
+    ).fit(values)
+
+    assert model.labels_.shape == (8,)
+    assert set(model.labels_) == {1, 2}
+    assert model.column_labels_.shape == (4,)
+    assert model.column_labels_[3] == -1
+    assert model.preprocessing_["inactive_column_indices"] == [3]
+    zero_rows = np.flatnonzero(~np.any(values[:, :3] > 0, axis=1))
+    assert np.all(model.labels_[zero_rows] == model.zero_row_cluster_)
+    assert np.all(model.predict(values[zero_rows]) == model.zero_row_cluster_)
+    assert model.metadata()["constraint_applicability"] == "not applicable"
+    assert "nearest_training_centroid" in model.metadata()["assignment_strategy"]
+
+    path = tmp_path / "spectral.joblib"
+    model.save(path)
+    loaded = SpectralCoclusteringModel.load(path)
+    np.testing.assert_array_equal(loaded.labels_, model.labels_)
+    np.testing.assert_array_equal(loaded.column_labels_, model.column_labels_)
+    np.testing.assert_array_equal(loaded.predict(values), model.predict(values))
+
+
+def test_spectral_coclustering_rejects_unsupported_input():
+    model = SpectralCoclusteringModel(
+        {"n_clusters": 2, "random_state": 123, "n_init": 2}
+    )
+    with pytest.raises(ValueError, match="finite"):
+        model.fit(np.array([[0.0, np.inf], [1.0, 2.0]]))
+    with pytest.raises(ValueError, match="no non-zero feature columns"):
+        model.fit(np.ones((10, 3)))
 
 
 def test_future_coclustering_is_registered_but_explicitly_unimplemented():

@@ -9,12 +9,14 @@ import yaml
 
 from cluster_representation import load_config
 from cluster_representation import pipeline, reporting, stages, storage, transformation
-from cluster_representation.evaluation import evaluate
+from cluster_representation.evaluation import evaluate, resolve_cluster_selection
 from cluster_representation.models.constrained_kmeans import ConstrainedKMeans
+from cluster_representation.nonconsent import scenario_percentages
 
 
 def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     results = pipeline.run(small_config)
+    assert small_config.models_run == ["constrained_kmeans"]
     assert [result.stage for result in results] == small_config["pipeline"]["steps"]
     root = small_config.artifact_dir
     assert (root / "manifest.json").is_file()
@@ -24,6 +26,8 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     assert (root / "prototypes/cluster_prototypes.parquet").is_file()
     assert (root / "predictions/test_cluster_assignments.parquet").is_file()
     assert (root / "metrics/results.json").is_file()
+    comparison_path = root / "tables/overall_comparison.md"
+    assert comparison_path.is_file()
     transformed = pd.read_parquet(
         root / "transformed/gdpr_20/transformed_test.parquet"
     )
@@ -35,6 +39,61 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     assert len(metrics["scenarios"]) == 6
     assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mae"] is None
     assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mae_status"] == "unavailable_no_replaced_rows"
+    assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mape"] is None
+    assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mape_status"] == (
+        "unavailable_no_replaced_rows"
+    )
+    assert "overall_test_mae" in metrics["scenarios"]["gdpr_20"]
+    assert "per_feature_mae" in metrics["scenarios"]["gdpr_20"]
+    assert "Replaced-row MAPE excludes cells with zero original values" in metrics[
+        "notes"
+    ][1]
+    markdown = comparison_path.read_text(encoding="utf-8")
+    assert markdown.startswith("### Overall comparison of evaluated methods\n\n")
+    assert (
+        "| Method | NC (%) | AP | F1 | MAE | MAPE (%) | \\|G\\| | k̄ | Time (s) |"
+        in markdown
+    )
+    table_rows = [
+        line
+        for line in markdown.splitlines()
+        if line.startswith("|")
+        and not line.startswith("| Method")
+        and not line.startswith("|--------")
+    ]
+    assert len(table_rows) == 6
+    for line, percent in zip(table_rows, (0, 20, 40, 60, 80, 100)):
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        scenario = metrics["scenarios"]["gdpr_{}".format(percent)]
+        assert cells[:4] == [
+            "constrained_kmeans (k=3)",
+            str(percent),
+            "—",
+            "—",
+        ]
+        if scenario["replaced_rows_mae"] is None:
+            assert cells[4] == "—"
+        else:
+            assert float(cells[4]) == pytest.approx(
+                scenario["replaced_rows_mae"]
+            )
+        if scenario["replaced_rows_mape"] is None:
+            assert cells[5] == "—"
+        else:
+            assert float(cells[5]) == pytest.approx(
+                scenario["replaced_rows_mape"]
+            )
+        assert cells[6:] == [
+            "3",
+            str(int(metrics["average_training_cluster_size"])),
+            str(metrics["timings_seconds"]["fitting"]),
+        ]
+    assert "MAE and MAPE are calculated only for replaced rows." in markdown
+    assert "MAPE excludes cells with zero original values." in markdown
+    assert "MAE averages features on their existing scales." in markdown
+    assert "Baseline" not in markdown
+    assert "CC |" not in markdown
+    assert "RCCC" not in markdown
     combined = reporting.combined_evaluation_report(small_config)
     assert len(combined) == 6
     assert combined["Clusters"].eq(3).all()
@@ -43,6 +102,51 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     ].iloc[0] == "N/A"
     assert (root / "metrics/combined_evaluation.csv").is_file()
     assert (root / "metrics/combined_evaluation.parquet").is_file()
+    assert not (root / "models/spectral_coclustering").exists()
+
+
+def test_overall_comparison_uses_configured_range(small_config_path):
+    default_config = load_config("config/default.yml")
+    assert scenario_percentages(default_config) == list(range(10, 101, 10))
+
+    settings = yaml.safe_load(small_config_path.read_text(encoding="utf-8"))
+    settings["nonconsent"].update(
+        {"start_percent": 10, "end_percent": 30, "step_percent": 10}
+    )
+    settings["output"]["run_name"] = "changed_scenario_range"
+    small_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    config = load_config(small_config_path)
+
+    pipeline.run(config)
+
+    root = config.artifact_dir
+    metrics = json.loads((root / "metrics/results.json").read_text(encoding="utf-8"))
+    markdown = (root / "tables/overall_comparison.md").read_text(encoding="utf-8")
+    rows = [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in markdown.splitlines()
+        if line.startswith("|")
+        and not line.startswith("| Method")
+        and not line.startswith("|--------")
+    ]
+    assert [int(row[1]) for row in rows] == [10, 20, 30]
+    for row in rows:
+        scenario = metrics["scenarios"]["gdpr_{}".format(row[1])]
+        assert row[0] == "constrained_kmeans (k=3)"
+        assert float(row[4]) == pytest.approx(scenario["replaced_rows_mae"])
+        if scenario["replaced_rows_mape"] is None:
+            assert row[5] == "—"
+        else:
+            assert float(row[5]) == pytest.approx(scenario["replaced_rows_mape"])
+
+    indicators = storage.read_frame(config, "data/nonconsent.parquet")
+    assert indicators[["gdpr_10", "gdpr_20", "gdpr_30"]].sum().tolist() == [
+        20,
+        40,
+        60,
+    ]
+    assert (indicators["gdpr_10"] <= indicators["gdpr_20"]).all()
+    assert (indicators["gdpr_20"] <= indicators["gdpr_30"]).all()
 
 
 def test_combined_report_aligns_scenarios_and_reuses_fitted_candidates(
@@ -50,7 +154,16 @@ def test_combined_report_aligns_scenarios_and_reuses_fitted_candidates(
 ):
     results = pipeline.run(small_search_config)
     train_result = next(result for result in results if result.stage == "train_model")
+    evaluation_result = next(result for result in results if result.stage == "evaluate")
     root = small_search_config.artifact_dir
+    markdown = (root / "tables/overall_comparison.md").read_text(encoding="utf-8")
+    assert "| constrained_kmeans (k=3) | 20 |" in markdown
+    assert "Baseline" not in markdown
+    assert "CC |" not in markdown
+    assert "RCCC" not in markdown
+    assert evaluation_result.artifacts["overall_comparison"] == (
+        "tables/overall_comparison.md"
+    )
     comparison = pd.read_parquet(root / train_result.artifacts["comparison"])
     successful = comparison.loc[comparison["status"].eq("success")]
 
@@ -75,6 +188,7 @@ def test_combined_report_aligns_scenarios_and_reuses_fitted_candidates(
     assert display.columns.tolist() == [
         "Model",
         "Clusters",
+        "Constraint applicability",
         "Non-consent (%)",
         "Smallest cluster",
         "Silhouette ↑",
@@ -94,6 +208,7 @@ def test_combined_report_aligns_scenarios_and_reuses_fitted_candidates(
     assert row["silhouette_score"] == pytest.approx(
         comparison_row["silhouette_score"]
     )
+    assert row["constraint_applicability"] == "applicable"
     assert row["davies_bouldin_index"] == pytest.approx(
         comparison_row["davies_bouldin_index"]
     )
@@ -153,6 +268,527 @@ def test_combined_report_aligns_scenarios_and_reuses_fitted_candidates(
         & display["Non-consent (%)"].eq(0),
         "MAE (replaced rows) ↓",
     ].iloc[0] == "N/A"
+
+
+def test_cluster_selection_report_uses_saved_candidate_metadata_and_ranks_metrics(
+    small_search_config, monkeypatch
+):
+    results = pipeline.run(small_search_config)
+    train_result = next(result for result in results if result.stage == "train_model")
+    evaluation_result = next(result for result in results if result.stage == "evaluate")
+    root = small_search_config.artifact_dir
+    comparison = pd.read_parquet(root / train_result.artifacts["comparison"])
+    successful = comparison.loc[comparison["status"].eq("success")]
+
+    report_path = root / "tables/cluster_selection_comparison.md"
+    assert report_path.is_file()
+    assert evaluation_result.artifacts["cluster_selection_comparison"] == (
+        "tables/cluster_selection_comparison.md"
+    )
+    markdown = report_path.read_text(encoding="utf-8")
+    rows = [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in markdown.splitlines()
+        if line.startswith("| constrained_kmeans")
+    ]
+    assert len(rows) == len(comparison)
+    assert [int(row[1]) for row in rows] == comparison["n_clusters"].tolist()
+    assert len({(row[0], row[1]) for row in rows}) == len(rows)
+
+    by_k = {int(row[1]): row for row in rows}
+    for candidate in successful.to_dict(orient="records"):
+        requested_k = int(candidate["n_clusters"])
+        metadata = storage.read_json(
+            small_search_config,
+            "models/constrained_kmeans/k_{}/metadata.json".format(requested_k),
+        )
+        row = by_k[requested_k]
+        assert row[2] == str(metadata["n_clusters"])
+        assert row[8] == str(metadata["training_time_seconds"])
+        assert row[7] == (
+            "Yes"
+            if requested_k
+            == small_search_config.model_config["cluster_search"]["selected_n_clusters"]
+            else "No"
+        )
+        for index, value_key, status_key, maximize in (
+            (3, "silhouette_score", "silhouette_status", True),
+            (4, "davies_bouldin_index", "davies_bouldin_status", False),
+            (
+                5,
+                "calinski_harabasz_index",
+                "calinski_harabasz_status",
+                True,
+            ),
+        ):
+            value = (
+                metadata[value_key]
+                if metadata[status_key] == "available"
+                else None
+            )
+            text = row[index]
+            assert (text == "—") == (value is None)
+            if value is not None:
+                rendered = text.removeprefix("**").removesuffix("**")
+                assert float(rendered) == value
+                assert text.startswith("**") == (
+                    value
+                    == (
+                        successful[value_key].max()
+                        if maximize
+                        else successful[value_key].min()
+                    )
+                )
+
+    assert "Bold values identify the best result" in markdown
+    assert "Higher silhouette and Calinski–Harabasz are better." in markdown
+    assert "Lower Davies–Bouldin is better." in markdown
+
+    def fail_if_fit(*args, **kwargs):
+        raise AssertionError("Reporting must not retrain candidate models")
+
+    monkeypatch.setattr(ConstrainedKMeans, "fit", fail_if_fit)
+    evaluation_metrics = storage.read_json(
+        small_search_config, evaluation_result.artifacts["metrics"]
+    )
+    reporting.export_cluster_selection_comparison(
+        small_search_config, evaluation_metrics
+    )
+
+
+def test_cluster_selection_report_marks_all_metric_ties():
+    rows = [
+        {
+            "method": "test_model",
+            "configuration_key": "{}",
+            "silhouette": 0.4,
+            "davies_bouldin": 1.0,
+            "calinski_harabasz": 12.0,
+        },
+        {
+            "method": "test_model",
+            "configuration_key": "{}",
+            "silhouette": 0.4,
+            "davies_bouldin": 1.0,
+            "calinski_harabasz": 12.0,
+        },
+    ]
+    reporting._mark_metric_winners(rows, "silhouette", maximize=True)
+    reporting._mark_metric_winners(rows, "davies_bouldin", maximize=False)
+    reporting._mark_metric_winners(rows, "calinski_harabasz", maximize=True)
+    assert all(row["silhouette_winner"] for row in rows)
+    assert all(row["davies_bouldin_winner"] for row in rows)
+    assert all(row["calinski_harabasz_winner"] for row in rows)
+
+    separate_configuration = [
+        {
+            "method": "test_model",
+            "configuration_key": "first",
+            "silhouette": 0.1,
+            "davies_bouldin": 2.0,
+            "calinski_harabasz": 4.0,
+        },
+        {
+            "method": "test_model",
+            "configuration_key": "first",
+            "silhouette": 0.2,
+            "davies_bouldin": 1.0,
+            "calinski_harabasz": 5.0,
+        },
+        {
+            "method": "test_model",
+            "configuration_key": "second",
+            "silhouette": 0.9,
+            "davies_bouldin": 3.0,
+            "calinski_harabasz": 2.0,
+        },
+        {
+            "method": "test_model",
+            "configuration_key": "second",
+            "silhouette": 0.5,
+            "davies_bouldin": 0.5,
+            "calinski_harabasz": 8.0,
+        },
+    ]
+    reporting._mark_metric_winners(
+        separate_configuration, "silhouette", maximize=True
+    )
+    reporting._mark_metric_winners(
+        separate_configuration, "davies_bouldin", maximize=False
+    )
+    reporting._mark_metric_winners(
+        separate_configuration, "calinski_harabasz", maximize=True
+    )
+    assert [
+        row["silhouette_winner"] for row in separate_configuration
+    ] == [False, True, True, False]
+    assert [
+        row["davies_bouldin_winner"] for row in separate_configuration
+    ] == [False, True, False, True]
+    assert [
+        row["calinski_harabasz_winner"] for row in separate_configuration
+    ] == [False, True, False, True]
+
+
+def test_auto_cluster_selection_uses_average_ranks_and_fixed_selection_is_preserved():
+    candidates = []
+    for k, silhouette, davies_bouldin, calinski_harabasz in (
+        (5, 0.9, 0.9, 10.0),
+        (6, 0.8, 1.0, 30.0),
+        (7, 0.7, 0.8, 20.0),
+        (8, 0.95, 0.5, 40.0),
+    ):
+        candidates.append(
+            {
+                "n_clusters": k,
+                "status": "success",
+                "model_parameters": json.dumps(
+                    {"n_clusters": k, "random_state": 123}
+                ),
+                "constraints": json.dumps({"min_cluster_size": 10}),
+                "minimum_cluster_size": 10 if k != 8 else 2,
+                "constraint_violations": 0 if k != 8 else 1,
+                "constraint_violation_clusters": [] if k != 8 else [1],
+                "silhouette_score": silhouette,
+                "silhouette_status": "available",
+                "davies_bouldin_index": davies_bouldin,
+                "davies_bouldin_status": "available",
+                "calinski_harabasz_index": calinski_harabasz,
+                "calinski_harabasz_status": "available",
+            }
+        )
+    constraints = {"min_cluster_size": 10}
+
+    automatic = resolve_cluster_selection("test_method", candidates, "auto", constraints)
+
+    eligible = automatic["candidate_results"][:3]
+    assert [candidate["selection_score"] for candidate in eligible] == [
+        2.0,
+        2.0,
+        2.0,
+    ]
+    assert automatic["selected_n_clusters"] == 5
+    assert automatic["candidate_results"][3]["eligible"] is False
+    assert "hard constraint violations" in automatic["candidate_results"][3][
+        "exclusion_reasons"
+    ][0]
+    assert automatic["excluded_candidates"][0]["requested_n_clusters"] == 8
+
+    fixed = resolve_cluster_selection("test_method", candidates, 7, constraints)
+    assert fixed["selection_mode"] == "fixed"
+    assert fixed["selected_n_clusters"] == 7
+    assert fixed["configured_selected_n_clusters"] == 7
+
+
+def test_auto_cluster_selection_reports_no_eligible_candidates():
+    failed = {
+        "n_clusters": 5,
+        "status": "failed",
+        "failure_reason": "fit failed",
+        "silhouette_status": "unavailable",
+        "davies_bouldin_status": "unavailable",
+        "calinski_harabasz_status": "unavailable",
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"no eligible candidates for constrained_kmeans.*k=5: training status is failed",
+    ):
+        resolve_cluster_selection(
+            "constrained_kmeans", [failed], "auto", {"min_cluster_size": 10}
+        )
+
+
+def test_auto_selection_routes_all_downstream_artifacts_through_resolved_model(
+    small_search_config_path,
+):
+    settings = yaml.safe_load(
+        small_search_config_path.read_text(encoding="utf-8")
+    )
+    model = copy.deepcopy(
+        yaml.safe_load(
+            (small_search_config_path.parent / "models/search.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    model["cluster_search"]["selected_n_clusters"] = "auto"
+    auto_model_path = small_search_config_path.parent / "models/search_auto.yml"
+    auto_model_path.write_text(yaml.safe_dump(model), encoding="utf-8")
+    settings["models"]["configs"]["constrained_kmeans"] = "models/search_auto.yml"
+    settings["output"]["run_name"] = "search_auto_run"
+    auto_config_path = small_search_config_path.parent / "search_auto.yml"
+    auto_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    from cluster_representation import load_config
+
+    auto_config = load_config(auto_config_path)
+    results = pipeline.run(auto_config)
+    train_result = next(result for result in results if result.stage == "train_model")
+    selection = storage.read_json(auto_config, train_result.artifacts["selection"])
+    selected_k = selection["selected_n_clusters"]
+    assert selection["selection_mode"] == "auto"
+    assert selection["configured_selected_n_clusters"] == "auto"
+    assert [item["requested_n_clusters"] for item in selection["candidate_results"]] == [
+        2,
+        3,
+        20,
+    ]
+    assert selection["excluded_candidates"][0]["requested_n_clusters"] == 20
+    assert "skipped_infeasible" in selection["excluded_candidates"][0]["reasons"][0]
+
+    root = auto_config.artifact_dir
+    resolved_config = yaml.safe_load(
+        (root / "resolved_config.yml").read_text(encoding="utf-8")
+    )
+    assert (
+        resolved_config["resolved_model_configs"]["constrained_kmeans"][
+            "cluster_search"
+        ][
+            "selected_n_clusters"
+        ]
+        == "auto"
+    )
+    assert (root / "models/constrained_kmeans/k_{}/cluster_prototypes.parquet".format(
+        selected_k
+    )).is_file()
+    assert (root / "predictions/constrained_kmeans/k_{}/test_cluster_assignments.parquet".format(
+        selected_k
+    )).is_file()
+    assert (root / "metrics/constrained_kmeans/k_{}/results.json".format(
+        selected_k
+    )).is_file()
+    assignments = pd.read_parquet(
+        root
+        / "models/constrained_kmeans/k_{}/train_cluster_assignments.parquet".format(
+            selected_k
+        )
+    )
+    fitted_model = storage.read_object(
+        auto_config,
+        "models/constrained_kmeans/k_{}/model.joblib".format(selected_k),
+    )
+    assert assignments["cluster"].tolist() == fitted_model.labels_.tolist()
+
+    report = (root / "tables/cluster_selection_comparison.md").read_text(
+        encoding="utf-8"
+    )
+    report_rows = [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in report.splitlines()
+        if line.startswith("| constrained_kmeans")
+    ]
+    assert len(report_rows) == 3
+    assert next(row for row in report_rows if int(row[1]) == selected_k)[7] == "Yes"
+    assert next(row for row in report_rows if row[1] == "20")[6] == "—"
+    assert "Automatic selection averages" in report
+
+
+def test_spectral_coclustering_runs_fixed_and_auto_pipeline_without_retraining(
+    small_config_path,
+):
+    settings = yaml.safe_load(
+        small_config_path.read_text(encoding="utf-8")
+    )
+    model_config = {
+        "name": "spectral_coclustering",
+        "parameters": {"random_state": 12345, "n_init": 2},
+        "cluster_search": {
+            "enabled": True,
+            "candidates": [2, 3],
+            "selected_n_clusters": 2,
+        },
+    }
+    model_path = small_config_path.parent / "models/spectral.yml"
+    model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
+    settings["models"]["run"] = ["spectral_coclustering"]
+    settings["models"]["configs"] = {"spectral_coclustering": "models/spectral.yml"}
+    settings["output"]["run_name"] = "spectral_pipeline"
+    config_path = small_config_path.parent / "spectral_run.yml"
+    config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    from cluster_representation import load_config
+
+    fixed_config = load_config(config_path)
+    fixed_results = pipeline.run(fixed_config)
+    fixed_training = next(
+        result for result in fixed_results if result.stage == "train_model"
+    )
+    assert fixed_training.summary["selected_n_clusters"] == 2
+    root = fixed_config.artifact_dir
+    model_path_k2 = root / "models/spectral_coclustering/k_2/model.joblib"
+    model_timestamp = model_path_k2.stat().st_mtime_ns
+    for candidate in (2, 3):
+        base = root / "models/spectral_coclustering/k_{}".format(candidate)
+        assert (base / "model.joblib").is_file()
+        assert (base / "model_preprocessor.joblib").is_file()
+        assert (base / "column_labels.parquet").is_file()
+        assignments = pd.read_parquet(base / "train_cluster_assignments.parquet")
+        model = storage.read_object(
+            fixed_config,
+            "models/spectral_coclustering/k_{}/model.joblib".format(candidate),
+        )
+        train = pd.read_parquet(root / "data/train_features.parquet")
+        shared_preprocessor = storage.read_object(
+            fixed_config, "preprocessing/preprocessor.joblib"
+        )
+        training_matrix = shared_preprocessor.transform(
+            train[[feature["name"] for feature in fixed_config["features"]]]
+        )
+        np.testing.assert_allclose(
+            model.feature_min_, training_matrix.min(axis=0)
+        )
+        assert assignments["id_row"].tolist() == train["id_row"].tolist()
+        assert assignments["cluster"].tolist() == model.labels_.tolist()
+        metadata = storage.read_json(
+            fixed_config,
+            "models/spectral_coclustering/k_{}/metadata.json".format(candidate),
+        )
+        assert metadata["constraint_applicability"] == "not applicable"
+        assert metadata["assignment_strategy"] == model.assignment_strategy
+        assert metadata["minimum_cluster_size"] < 100
+        columns = pd.read_parquet(base / "column_labels.parquet")
+        np.testing.assert_array_equal(columns["column_cluster"], model.column_labels_)
+
+    model_config["cluster_search"]["selected_n_clusters"] = "auto"
+    model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
+    auto_config = load_config(config_path)
+    auto_results = pipeline.run(auto_config)
+    auto_training = next(
+        result for result in auto_results if result.stage == "train_model"
+    )
+    selection = storage.read_json(auto_config, auto_training.artifacts["selection"])
+    eligible = [
+        item for item in selection["candidate_results"] if item["eligible"]
+    ]
+    assert selection["selection_mode"] == "auto"
+    assert selection["configured_selected_n_clusters"] == "auto"
+    assert selection["selected_n_clusters"] == min(
+        eligible, key=lambda item: (item["selection_score"], item["requested_n_clusters"])
+    )["requested_n_clusters"]
+    assert model_path_k2.stat().st_mtime_ns == model_timestamp
+
+    selected = selection["selected_n_clusters"]
+    test = pd.read_parquet(root / "data/test_features.parquet")
+    predicted = pd.read_parquet(
+        root
+        / "predictions/spectral_coclustering/k_{}/test_cluster_assignments.parquet".format(
+            selected
+        )
+    )
+    assert predicted["id_row"].tolist() == test["id_row"].tolist()
+    assert (root / "models/spectral_coclustering/k_{}/cluster_prototypes.parquet".format(
+        selected
+    )).is_file()
+    metrics_path = "metrics/spectral_coclustering/k_{}/results.json".format(selected)
+    metrics = storage.read_json(auto_config, metrics_path)
+    assert metrics["constraint_applicability"] == "not applicable"
+    assert metrics["assignment_strategy"].startswith("nearest_training_centroid")
+    assert metrics["clustering_metric_feature_space"].startswith(
+        "shared fitted preprocessing output"
+    )
+    assert metrics["classification_metrics"]["average_precision"] == {
+        "value": None,
+        "status": "unavailable_no_ground_truth_labels",
+    }
+    assert len(metrics["scenarios"]) == 6
+    for scenario in metrics["scenarios"].values():
+        assert "replaced_rows_mae" in scenario
+        assert "replaced_rows_mape" in scenario
+
+    report_path = root / "tables/cluster_selection_comparison.md"
+    report = report_path.read_text(encoding="utf-8")
+    report_rows = [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in report.splitlines()
+        if line.startswith("| spectral_coclustering")
+    ]
+    assert len(report_rows) == 2
+    assert next(row for row in report_rows if int(row[1]) == selected)[7] == "Yes"
+    assert "Constraint applicability: not applicable." in report
+    overall = (root / "tables/overall_comparison.md").read_text(encoding="utf-8")
+    assert len(
+        [
+            line
+            for line in overall.splitlines()
+            if line.startswith("| spectral_coclustering")
+        ]
+    ) == 6
+    assert "Constraints: not applicable" in overall
+    combined = reporting.combined_evaluation_report(auto_config)
+    assert (combined["Constraint applicability"] == "not applicable").all()
+    assert len(combined) == len(eligible) * 6
+
+
+def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
+    small_search_config_path,
+):
+    settings = yaml.safe_load(
+        small_search_config_path.read_text(encoding="utf-8")
+    )
+    spectral_config_path = small_search_config_path.parent / "models/spectral.yml"
+    spectral_model = {
+        "name": "spectral_coclustering",
+        "parameters": {"random_state": 12345, "n_init": 2},
+        "cluster_search": {
+            "enabled": True,
+            "candidates": [2, 3],
+            "selected_n_clusters": "auto",
+        },
+    }
+    spectral_config_path.write_text(yaml.safe_dump(spectral_model), encoding="utf-8")
+    settings["models"]["run"] = ["constrained_kmeans", "spectral_coclustering"]
+    settings["models"]["configs"]["spectral_coclustering"] = "models/spectral.yml"
+    settings["output"]["run_name"] = "multi_model_run"
+    config_path = small_search_config_path.parent / "multi_model.yml"
+    config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    from cluster_representation import load_config
+
+    config = load_config(config_path)
+    results = pipeline.run(config)
+    model_training = [
+        result
+        for result in results
+        if result.stage == "train_model"
+    ]
+    assert [result.config.model_config["name"] for result in model_training] == [
+        "constrained_kmeans",
+        "spectral_coclustering",
+    ]
+    assert sum(result.stage == "generate_dataset" for result in results) == 1
+    assert sum(result.stage == "fit_preprocessor" for result in results) == 1
+    assert len([result for result in results if result.stage == "evaluate"]) == 2
+
+    root = config.artifact_dir
+    for model_name in ("constrained_kmeans", "spectral_coclustering"):
+        assert (root / "models/{}/search_{}/comparison.parquet".format(
+            model_name,
+            storage.cluster_search_fingerprint(config.for_model(model_name))[:12],
+        )).is_file()
+        assert (root / "metrics/{}/k_{}".format(
+            model_name,
+            storage.selected_candidate(config.for_model(model_name)),
+        ) / "results.json").is_file()
+    overall = (root / "tables/overall_comparison.md").read_text(encoding="utf-8")
+    overall_rows = [
+        line
+        for line in overall.splitlines()
+        if line.startswith("| constrained_kmeans")
+        or line.startswith("| spectral_coclustering")
+    ]
+    assert len(overall_rows) == 12
+    assert sum(line.startswith("| constrained_kmeans") for line in overall_rows) == 6
+    assert sum(line.startswith("| spectral_coclustering") for line in overall_rows) == 6
+    cluster_report = (
+        root / "tables/cluster_selection_comparison.md"
+    ).read_text(encoding="utf-8")
+    assert any(
+        line.startswith("| constrained_kmeans")
+        for line in cluster_report.splitlines()
+    )
+    assert any(
+        line.startswith("| spectral_coclustering")
+        for line in cluster_report.splitlines()
+    )
+    assert "Selection mode: auto." in cluster_report
 
 
 def test_changing_selected_scenario_reuses_model_and_cluster_assignments(small_config):
@@ -256,7 +892,7 @@ def test_cluster_search_builds_fitted_membership_prototypes_and_selects_without_
     selected_model["cluster_search"]["selected_n_clusters"] = 2
     selected_model_path = small_search_config.source_path.parent / "models" / "search_select_2.yml"
     selected_model_path.write_text(yaml.safe_dump(selected_model), encoding="utf-8")
-    settings["model"]["config_path"] = "models/search_select_2.yml"
+    settings["models"]["configs"]["constrained_kmeans"] = "models/search_select_2.yml"
     selected_config_path = small_search_config.source_path.parent / "search_select_2.yml"
     selected_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
     from cluster_representation import load_config
@@ -301,7 +937,7 @@ def test_cluster_search_builds_fitted_membership_prototypes_and_selects_without_
     extended_model["cluster_search"]["selected_n_clusters"] = 2
     extended_model_path = small_search_config.source_path.parent / "models" / "search_extended.yml"
     extended_model_path.write_text(yaml.safe_dump(extended_model), encoding="utf-8")
-    settings["model"]["config_path"] = "models/search_extended.yml"
+    settings["models"]["configs"]["constrained_kmeans"] = "models/search_extended.yml"
     extended_config_path = small_search_config.source_path.parent / "search_extended.yml"
     extended_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
@@ -338,7 +974,9 @@ def test_cluster_search_rejects_infeasible_selected_candidate_for_downstream(
     model["cluster_search"]["selected_n_clusters"] = 20
     model_path = small_search_config.source_path.parent / "models" / "search_select_infeasible.yml"
     model_path.write_text(yaml.safe_dump(model), encoding="utf-8")
-    settings["model"]["config_path"] = "models/search_select_infeasible.yml"
+    settings["models"]["configs"]["constrained_kmeans"] = (
+        "models/search_select_infeasible.yml"
+    )
     config_path = small_search_config.source_path.parent / "select_infeasible.yml"
     config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
     from cluster_representation import load_config
@@ -349,6 +987,14 @@ def test_cluster_search_rejects_infeasible_selected_candidate_for_downstream(
 
 
 def test_cluster_search_records_model_fit_failures(small_search_config, monkeypatch):
+    model_config = copy.deepcopy(small_search_config.model_config)
+    model_config["cluster_search"]["selected_n_clusters"] = 2
+    small_search_config.model_config_path.write_text(
+        yaml.safe_dump(model_config), encoding="utf-8"
+    )
+    from cluster_representation import load_config
+
+    small_search_config = load_config(small_search_config.source_path)
     stages.generate_dataset(small_search_config)
     stages.split_dataset(small_search_config)
     stages.fit_preprocessor(small_search_config)
@@ -442,3 +1088,107 @@ def test_metrics_handle_undefined_clustering_and_no_replacements(small_config):
     )
     assert metrics["clustering_metrics"]["silhouette"]["value"] is None
     assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mae"] is None
+    assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mae_status"] == (
+        "unavailable_no_replaced_rows"
+    )
+    assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mape"] is None
+    assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mape_status"] == (
+        "unavailable_no_replaced_rows"
+    )
+    assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mape_valid_cells"] == 0
+    assert metrics["scenarios"]["gdpr_0"][
+        "replaced_rows_mape_excluded_zero_cells"
+    ] == 0
+
+
+def test_replaced_row_mae_and_mape_exclude_nonreplaced_rows(small_config):
+    original = pd.DataFrame(
+        {
+            "id_row": [1, 2],
+            "ft_1": [10.0, 1.0],
+            "ft_2": [20.0, 1.0],
+            "ft_3": [0.0, 1.0],
+        }
+    )
+    assignments = pd.DataFrame({"id_row": [1, 2], "cluster": [1, 1]})
+    transformed = original.copy()
+    transformed.loc[0, ["ft_1", "ft_2", "ft_3"]] = [12.0, 16.0, 3.0]
+    transformed.loc[1, ["ft_1", "ft_2", "ft_3"]] = [1.0, 1.0, 1.0]
+    transformed.insert(1, "gdpr", [1, 0])
+    transformed.insert(2, "cluster", [1, 1])
+
+    def evaluate_scenario(scenario):
+        return evaluate(
+            [[0.0, 0.0], [1.0, 1.0]],
+            [1, 1],
+            original,
+            assignments,
+            {"gdpr_20": scenario},
+            {1: 2},
+            {"gdpr_20": {"requested": 0.2, "overall": 0.2, "train": 0.2, "test": 0.2}},
+            small_config,
+        )["scenarios"]["gdpr_20"]
+
+    result = evaluate_scenario(transformed)
+    assert result["replaced_rows_mae"] == pytest.approx(3.0)
+    assert result["replaced_rows_mape"] == pytest.approx(20.0)
+    assert result["replaced_rows_mape_status"] == "available"
+    assert result["replaced_rows_mape_valid_cells"] == 2
+    assert result["replaced_rows_mape_excluded_zero_cells"] == 1
+
+    changed_nonreplaced = transformed.copy()
+    changed_nonreplaced.loc[1, ["ft_1", "ft_2", "ft_3"]] = [
+        1000.0,
+        -2000.0,
+        3000.0,
+    ]
+    changed_result = evaluate_scenario(changed_nonreplaced)
+    assert changed_result["replaced_rows_mae"] == pytest.approx(
+        result["replaced_rows_mae"]
+    )
+    assert changed_result["replaced_rows_mape"] == pytest.approx(
+        result["replaced_rows_mape"]
+    )
+    assert changed_result["overall_test_mae"] != result["overall_test_mae"]
+
+    small_config["nonconsent"].update(
+        {"start_percent": 20, "end_percent": 20, "step_percent": 10}
+    )
+    markdown_metrics = {
+        "n_clusters": 3,
+        "average_training_cluster_size": 2,
+        "timings_seconds": {"fitting": 1.0},
+        "scenarios": {"gdpr_20": result},
+    }
+    reporting.export_overall_comparison(small_config, markdown_metrics)
+    original_row = (
+        small_config.artifact_dir / "tables/overall_comparison.md"
+    ).read_text(encoding="utf-8").splitlines()[4]
+    markdown_metrics["scenarios"]["gdpr_20"] = changed_result
+    reporting.export_overall_comparison(small_config, markdown_metrics)
+    changed_row = (
+        small_config.artifact_dir / "tables/overall_comparison.md"
+    ).read_text(encoding="utf-8").splitlines()[4]
+    assert changed_row == original_row
+
+    all_zero_original = original.copy()
+    all_zero_original.loc[0, ["ft_1", "ft_2", "ft_3"]] = 0.0
+    all_zero_transformed = transformed.copy()
+    all_zero_transformed.loc[0, ["ft_1", "ft_2", "ft_3"]] = [1.0, 2.0, 3.0]
+    zero_metrics = evaluate(
+        [[0.0, 0.0], [1.0, 1.0]],
+        [1, 1],
+        all_zero_original,
+        assignments,
+        {"gdpr_20": all_zero_transformed},
+        {1: 2},
+        {"gdpr_20": {"requested": 0.2, "overall": 0.2, "train": 0.2, "test": 0.2}},
+        small_config,
+    )["scenarios"]["gdpr_20"]
+    assert zero_metrics["replaced_rows_mae"] == pytest.approx(2.0)
+    assert zero_metrics["replaced_rows_mape"] is None
+    assert zero_metrics["replaced_rows_mape_status"] == (
+        "unavailable_no_nonzero_original_values"
+    )
+    assert zero_metrics["replaced_rows_mape_valid_cells"] == 0
+    assert zero_metrics["replaced_rows_mape_excluded_zero_cells"] == 3

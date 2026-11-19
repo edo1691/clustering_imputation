@@ -1,6 +1,8 @@
 """Clustering and original-unit replacement metrics."""
 
-from typing import Any, Dict, Mapping, Optional
+import json
+import math
+from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,6 +14,262 @@ from sklearn.metrics import (
 )
 
 from .randomness import generator
+
+
+CLUSTER_SELECTION_RULE = (
+    "Mean average rank of silhouette (descending), Davies-Bouldin (ascending), "
+    "and Calinski-Harabasz (descending); ties select the smaller requested k."
+)
+
+
+def resolve_cluster_selection(
+    method: str,
+    candidates: List[Mapping[str, Any]],
+    configured_selection: Any,
+    constraints: Mapping[str, Any],
+    constraints_applicable: bool = True,
+) -> Dict[str, Any]:
+    """Resolve fixed or rank-based cluster selection from training metrics."""
+    selection_mode = "auto" if configured_selection == "auto" else "fixed"
+    candidate_results = []
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for candidate in candidates:
+        requested_k = int(candidate["n_clusters"])
+        parameters = _selection_mapping(candidate.get("model_parameters"))
+        parameters.pop("n_clusters", None)
+        candidate_constraints = _selection_mapping(candidate.get("constraints"))
+        if not candidate_constraints and constraints_applicable:
+            candidate_constraints = dict(constraints)
+        configuration = {
+            "parameters": parameters,
+            "constraints": candidate_constraints,
+        }
+        configuration_key = json.dumps(
+            configuration,
+            sort_keys=True,
+            default=str,
+        )
+        reasons = _selection_exclusion_reasons(
+            candidate, constraints, constraints_applicable
+        )
+        candidate_result = {
+            "requested_n_clusters": requested_k,
+            "actual_clusters": (
+                int(candidate.get("n_clusters"))
+                if candidate.get("status") == "success"
+                else None
+            ),
+            "status": candidate.get("status"),
+            "failure_reason": candidate.get("failure_reason"),
+            "training_time_seconds": candidate.get("training_time_seconds"),
+            "configuration": configuration,
+            "configuration_key": configuration_key,
+            "metrics": {
+                "silhouette": _selection_metric(candidate, "silhouette"),
+                "davies_bouldin": _selection_metric(candidate, "davies_bouldin"),
+                "calinski_harabasz": _selection_metric(candidate, "calinski_harabasz"),
+            },
+            "metric_ranks": {
+                "silhouette": None,
+                "davies_bouldin": None,
+                "calinski_harabasz": None,
+            },
+            "selection_score": None,
+            "eligible": not reasons,
+            "exclusion_reasons": reasons,
+        }
+        candidate_results.append(candidate_result)
+        if not reasons:
+            grouped.setdefault(configuration_key, []).append(candidate_result)
+
+    for group in grouped.values():
+        rank_values = {
+            "silhouette": _average_ranks(
+                [item["metrics"]["silhouette"] for item in group], reverse=True
+            ),
+            "davies_bouldin": _average_ranks(
+                [item["metrics"]["davies_bouldin"] for item in group], reverse=False
+            ),
+            "calinski_harabasz": _average_ranks(
+                [item["metrics"]["calinski_harabasz"] for item in group],
+                reverse=True,
+            ),
+        }
+        for index, item in enumerate(group):
+            item["metric_ranks"] = {
+                metric: ranks[index] for metric, ranks in rank_values.items()
+            }
+            item["selection_score"] = float(
+                np.mean(list(item["metric_ranks"].values()))
+            )
+
+    if selection_mode == "auto":
+        if not grouped:
+            details = []
+            for candidate in candidate_results:
+                details.append(
+                    "k={}: {}".format(
+                        candidate["requested_n_clusters"],
+                        "; ".join(candidate["exclusion_reasons"])
+                        or "not eligible",
+                    )
+                )
+            raise ValueError(
+                "Automatic cluster selection found no eligible candidates for "
+                "{}. {}".format(method, " | ".join(details))
+            )
+        if len(grouped) != 1:
+            raise ValueError(
+                "Automatic cluster selection for {} found {} non-equivalent "
+                "candidate configuration groups; one run can select only one "
+                "configuration.".format(method, len(grouped))
+            )
+        eligible = next(iter(grouped.values()))
+        winner = min(
+            eligible,
+            key=lambda item: (
+                item["selection_score"],
+                item["requested_n_clusters"],
+            ),
+        )
+        selected_n_clusters = int(winner["requested_n_clusters"])
+    else:
+        selected_n_clusters = int(configured_selection)
+        if not any(
+            item["requested_n_clusters"] == selected_n_clusters
+            for item in candidate_results
+        ):
+            raise ValueError(
+                "Fixed cluster selection {} for {} is absent from candidate results".format(
+                    selected_n_clusters, method
+                )
+            )
+
+    return {
+        "method": method,
+        "selection_mode": selection_mode,
+        "configured_selected_n_clusters": configured_selection,
+        "selected_n_clusters": selected_n_clusters,
+        "selection_rule": CLUSTER_SELECTION_RULE,
+        "constraint_applicability": (
+            "applicable" if constraints_applicable else "not applicable"
+        ),
+        "candidate_results": candidate_results,
+        "excluded_candidates": [
+            {
+                "requested_n_clusters": item["requested_n_clusters"],
+                "reasons": item["exclusion_reasons"],
+            }
+            for item in candidate_results
+            if not item["eligible"]
+        ],
+    }
+
+
+def _selection_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _selection_metric(
+    candidate: Mapping[str, Any], metric_name: str
+) -> Optional[float]:
+    value_keys = {
+        "silhouette": "silhouette_score",
+        "davies_bouldin": "davies_bouldin_index",
+        "calinski_harabasz": "calinski_harabasz_index",
+    }
+    value = candidate.get(value_keys[metric_name])
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric_value):
+        return None
+    return numeric_value
+
+
+def _selection_exclusion_reasons(
+    candidate: Mapping[str, Any],
+    constraints: Mapping[str, Any],
+    constraints_applicable: bool = True,
+) -> List[str]:
+    reasons = []
+    status = candidate.get("status")
+    if status != "success":
+        reason = "training status is {}".format(status or "unknown")
+        if candidate.get("failure_reason"):
+            reason += ": {}".format(candidate["failure_reason"])
+        reasons.append(reason)
+
+    if constraints_applicable:
+        violations = candidate.get("constraint_violations", 0)
+        violation_clusters = candidate.get("constraint_violation_clusters", [])
+        if violation_clusters is None or (
+            isinstance(violation_clusters, (float, np.floating))
+            and math.isnan(float(violation_clusters))
+        ):
+            violation_cluster_count = 0
+        else:
+            try:
+                violation_cluster_count = len(violation_clusters)
+            except TypeError:
+                violation_cluster_count = int(bool(violation_clusters))
+        try:
+            numeric_violations = float(violations or 0)
+            violation_count = (
+                int(numeric_violations) if math.isfinite(numeric_violations) else 0
+            )
+        except (TypeError, ValueError):
+            violation_count = 1
+        if violation_count or violation_cluster_count:
+            reasons.append(
+                "hard constraint violations recorded ({})".format(
+                    violation_count or violation_cluster_count
+                )
+            )
+        minimum_size = constraints.get("min_cluster_size")
+        actual_minimum = candidate.get("minimum_cluster_size")
+        if minimum_size is not None and actual_minimum is not None:
+            try:
+                actual_minimum_value = float(actual_minimum)
+                if not math.isfinite(actual_minimum_value):
+                    raise ValueError("non-finite minimum cluster size")
+                if int(actual_minimum_value) < int(minimum_size):
+                    reasons.append(
+                        "minimum cluster size {} is below required {}".format(
+                            actual_minimum, minimum_size
+                        )
+                    )
+            except (TypeError, ValueError):
+                reasons.append("minimum cluster size is unavailable")
+
+    statuses = {
+        "silhouette": candidate.get("silhouette_status"),
+        "davies_bouldin": candidate.get("davies_bouldin_status"),
+        "calinski_harabasz": candidate.get("calinski_harabasz_status"),
+    }
+    for metric, status_value in statuses.items():
+        if status_value != "available" or _selection_metric(candidate, metric) is None:
+            reasons.append(
+                "{} metric is unavailable or non-finite ({})".format(
+                    metric, status_value or "missing status"
+                )
+            )
+    return reasons
+
+
+def _average_ranks(values: List[float], reverse: bool) -> List[float]:
+    ordered = sorted(set(values), reverse=reverse)
+    ranks = {}
+    start = 1
+    for value in ordered:
+        count = values.count(value)
+        ranks[value] = (start + start + count - 1) / 2.0
+        start += count
+    return [ranks[value] for value in values]
 
 
 def evaluate_training_candidate(
@@ -110,11 +368,28 @@ def evaluate(
         "clustering_metrics": _clustering_metrics(
             model_inputs, labels, config
         ),
+        "clustering_metric_feature_space": (
+            "shared fitted preprocessing output (median imputation; {} scaling)".format(
+                config["preprocessing"]["scaling"]
+            )
+        ),
+        "classification_metrics": {
+            "average_precision": {
+                "value": None,
+                "status": "unavailable_no_ground_truth_labels",
+            },
+            "f1": {
+                "value": None,
+                "status": "unavailable_no_ground_truth_labels",
+            },
+        },
         "scenarios": {},
         "timings_seconds": dict(timings or {}),
         "artifact_sizes_bytes": dict(artifact_sizes or {}),
         "notes": [
             "Overall replacement MAE aggregates different feature scales.",
+            "Replaced-row MAPE excludes cells with zero original values because "
+            "percentage error is undefined for those cells.",
             "Original transactional features are accessible for cluster assignment. "
             "For simulated non-consenting customers, their direct downstream "
             "representation is replaced with training-derived cluster medians.",
@@ -140,10 +415,15 @@ def evaluate(
             raise ValueError("{} rows do not align with original test rows".format(scenario_name))
         if transformed["gdpr"].isna().any() or not transformed["gdpr"].isin([0, 1]).all():
             raise ValueError("{} contains invalid non-consent values".format(scenario_name))
-        expected_replaced = config["transformation"]["replace_when"]
         row_errors = np.abs(
             transformed[feature_names].to_numpy(dtype=float)
             - test_original[feature_names].to_numpy(dtype=float)
+        )
+        original_values = test_original[feature_names].to_numpy(dtype=float)
+        transformed_values = transformed[feature_names].to_numpy(dtype=float)
+        replaced_mask = (
+            transformed["gdpr"].to_numpy()
+            == config["transformation"]["replace_when"]
         )
         per_feature = {
             name: float(mean_absolute_error(
@@ -152,12 +432,30 @@ def evaluate(
             ))
             for name in feature_names
         }
-        replaced_mask = transformed["gdpr"].to_numpy() == expected_replaced
-        replaced_mae = (
-            float(row_errors[replaced_mask].mean())
-            if replaced_mask.any()
-            else None
+        replaced_row_errors = row_errors[replaced_mask]
+        replaced_mae = float(replaced_row_errors.mean()) if replaced_mask.any() else None
+        replaced_original_values = original_values[replaced_mask]
+        replaced_absolute_errors = np.abs(
+            transformed_values[replaced_mask] - replaced_original_values
         )
+        valid_mape_cells = np.abs(replaced_original_values) != 0
+        valid_cell_count = int(valid_mape_cells.sum())
+        excluded_zero_cell_count = int(valid_mape_cells.size - valid_cell_count)
+        if not replaced_mask.any():
+            replaced_mape = None
+            replaced_mape_status = "unavailable_no_replaced_rows"
+        elif valid_cell_count == 0:
+            replaced_mape = None
+            replaced_mape_status = "unavailable_no_nonzero_original_values"
+        else:
+            replaced_mape = float(
+                100.0
+                * np.mean(
+                    replaced_absolute_errors[valid_mape_cells]
+                    / np.abs(replaced_original_values[valid_mape_cells])
+                )
+            )
+            replaced_mape_status = "available"
         requested = requested_rates.get(scenario_name, {})
         result["scenarios"][scenario_name] = {
             "requested_nonconsent_rate": requested.get("requested"),
@@ -168,6 +466,10 @@ def evaluate(
             "per_feature_mae": per_feature,
             "overall_test_mae": float(row_errors.mean()),
             "replaced_rows_mae": replaced_mae,
+            "replaced_rows_mape": replaced_mape,
+            "replaced_rows_mape_status": replaced_mape_status,
+            "replaced_rows_mape_valid_cells": valid_cell_count,
+            "replaced_rows_mape_excluded_zero_cells": excluded_zero_cell_count,
             "replaced_rows_mae_status": (
                 "available" if replaced_mask.any() else "unavailable_no_replaced_rows"
             ),

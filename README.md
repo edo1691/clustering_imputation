@@ -142,13 +142,23 @@ used for silhouette comparisons. Each candidate's model, fitted training
 assignments, metadata, and training-median prototypes are saved in their own
 `models/constrained_kmeans/k_<K>/` directory.
 
-`selected_n_clusters` chooses which successfully trained candidate is used for
-test assignment and replacement; it does not cause candidate models to be
-refitted. If the selected candidate was skipped or failed, downstream stages
-stop with an explicit error. The training notebook displays the saved
-comparison table and package-generated score plot. Legacy single-model
-configurations with `parameters.n_clusters` and no `cluster_search` remain
-supported.
+`selected_n_clusters` may be a positive candidate integer or `auto`. An
+integer always selects that candidate, regardless of its relative metric
+scores. `auto` requires enabled search and ranks eligible candidates by the
+average ranks of silhouette (descending), Davies–Bouldin (ascending), and
+Calinski–Harabasz (descending). Ties in metric values receive average ranks;
+the lowest mean rank wins, with smaller requested `k` breaking a score tie.
+Training failures, unavailable/non-finite metrics, and hard-constraint
+violations are excluded and reported. Automatic selection fails explicitly if
+no candidate is eligible.
+
+The resolved candidate is used for test assignment and replacement; changing
+the selected candidate does not refit candidate models. If a fixed candidate
+was skipped or failed, training stops with an explicit error. The training
+notebook displays the saved comparison table, including automatic selection
+scores and the chosen candidate, and the package-generated score plot. Legacy
+single-model configurations with `parameters.n_clusters` and no
+`cluster_search` remain supported.
 
 The evaluation notebook writes `metrics/combined_evaluation.csv` and
 `metrics/combined_evaluation.parquet`. Search runs include one row for each
@@ -158,6 +168,82 @@ errors are calculated from each saved candidate model and prototype without
 refitting. The returned notebook table uses readable labels and displays
 unavailable values as `N/A`; the exported files retain machine-readable column
 names and null metric values.
+
+The evaluation stage also writes `tables/overall_comparison.md` in the current
+run directory. It reports the selected constrained K-means candidate and
+configured non-consent scenario; AP and F1 are shown as unavailable because
+they are not calculated by this clustering workflow. The table's time column
+is model fitting time in seconds. Its MAE and MAPE columns are calculated only
+over replaced rows and configured features; MAPE excludes cells whose original
+value is zero. The detailed scenario results retain the all-test-row MAE and
+per-feature MAE metrics for compatibility.
+
+The evaluation stage also writes `tables/cluster_selection_comparison.md`,
+with one row for each successfully trained cluster-count candidate. It reads
+training metrics and `training_time_seconds` from saved candidate metadata;
+metric winners are ranked at full precision within each equivalent model
+configuration, and ties are all bolded.
+
+## Spectral co-clustering
+
+To run the unconstrained scikit-learn `SpectralCoclustering` model, point the
+model name in `models.run` in `config/default.yml` and map it to its model
+configuration under `models.configs`. For example:
+
+```yaml
+models:
+  run:
+    - constrained_kmeans
+    - spectral_coclustering
+  configs:
+    constrained_kmeans: models/constrained_kmeans.yml
+    spectral_coclustering: models/spectral_coclustering.yml
+```
+
+Only models listed in `models.run` are executed, in that order. Keep each
+model's parameters and search settings in its mapped configuration file. The
+spectral model configuration supports fixed or automatic selection:
+
+```yaml
+name: spectral_coclustering
+parameters:
+  random_state: 12345
+  n_init: 10
+cluster_search:
+  enabled: true
+  candidates: [5, 6, 7]
+  selected_n_clusters: auto
+```
+
+Set `selected_n_clusters` to a candidate integer (for example `5`) to use a
+fixed count. Spectral co-clustering has no minimum-cluster-size constraint;
+constraint applicability is saved as `not applicable`. Its `n_init` and
+`random_state` parameters are passed to scikit-learn; `max_iter` is not
+accepted because `SpectralCoclustering` does not expose that parameter.
+
+The shared, training-fitted preprocessing remains unchanged. The model then
+fits its own training-only min/max conversion to finite nonnegative values,
+removes constant/all-zero feature columns from the spectral fit, and stores
+that preprocessing with each candidate. All-zero training rows are omitted
+from the spectral fit and assigned to the largest fitted row cluster;
+all-zero future rows use the same deterministic rule. Saved active column
+labels retain scikit-learn's zero-based labels; dropped feature columns use
+`-1` in `column_labels.parquet`.
+
+The registered `constrained_coclustering` and
+`robust_constrained_coclustering` entries remain unimplemented templates;
+selecting either currently raises `NotImplementedError`.
+
+Because `SpectralCoclustering` has no `predict`, future customers are assigned
+to the nearest centroid of the fitted row memberships in the model's saved,
+nonnegative feature space. The model and `column_labels.parquet` are saved
+separately per candidate. For fair customer-cluster comparisons, silhouette,
+Davies–Bouldin, and Calinski–Harabasz are calculated in the shared fitted
+preprocessing output space, not the model-specific nonnegative space.
+Candidates that exceed the active matrix dimensions or otherwise cannot be
+fit are reported as failed and are ineligible for automatic selection.
+AP/F1 remain unavailable because this workflow has no ground-truth customer
+class labels.
 
 `constrained_coclustering` and `robust_constrained_coclustering` remain
 configuration-only templates: their `fit()` and `predict()` methods explicitly

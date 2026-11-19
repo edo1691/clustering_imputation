@@ -193,6 +193,30 @@ def train_model(config: LoadedConfig) -> StageResult:
     fit_seconds = time.perf_counter() - fit_started
     model_path = "models/model.joblib"
     metadata_path = "models/metadata.json"
+    artifacts = {"model": model_path, "metadata": metadata_path}
+    training_artifacts = [model_path, metadata_path]
+    if config.model_config["name"] == "spectral_coclustering":
+        preprocessing_path = "models/model_preprocessor.joblib"
+        column_labels_path = "models/column_labels.parquet"
+        storage.write_object(config, preprocessing_path, model.preprocessing_)
+        storage.write_frame(
+            config,
+            column_labels_path,
+            pd.DataFrame(
+                {
+                    "feature_index": np.arange(len(names)),
+                    "feature": names,
+                    "column_cluster": model.column_labels_,
+                }
+            ),
+        )
+        artifacts.update(
+            {
+                "model_preprocessor": preprocessing_path,
+                "column_labels": column_labels_path,
+            }
+        )
+        training_artifacts.extend([preprocessing_path, column_labels_path])
     storage.write_object(config, model_path, model)
     training_labels = np.asarray(model.labels_, dtype=int)
     metadata = model.metadata()
@@ -201,6 +225,7 @@ def train_model(config: LoadedConfig) -> StageResult:
     )
     metadata["feature_order"] = names
     metadata["fit_seconds"] = fit_seconds
+    metadata["training_time_seconds"] = fit_seconds
     metadata["training_cluster_sizes"] = {
         str(int(cluster)): int(count)
         for cluster, count in zip(*np.unique(training_labels, return_counts=True))
@@ -211,7 +236,7 @@ def train_model(config: LoadedConfig) -> StageResult:
         config,
         "train_model",
         fingerprint,
-        [model_path, metadata_path],
+        training_artifacts,
         {"fit_preprocessor": preprocessor_fp},
         {
             "training_rows": len(train_features),
@@ -221,7 +246,7 @@ def train_model(config: LoadedConfig) -> StageResult:
     )
     return StageResult(
         "train_model",
-        {"model": model_path, "metadata": metadata_path},
+        artifacts,
         {"training_rows": len(train_features), "cluster_sizes": metadata["training_cluster_sizes"]},
         config,
     )
@@ -234,6 +259,9 @@ def _train_cluster_search(
     preprocessor_fingerprint: str,
 ) -> StageResult:
     search = config.model_config["cluster_search"]
+    model_name = config.model_config["name"]
+    constraints_applicable = model_name == "constrained_kmeans"
+    constraints = config.model_config.get("constraints", {})
     n_train = len(train_features)
     id_column = config["dataset"]["id_column"]
     seed = config.model_config["parameters"]["random_state"]
@@ -244,16 +272,25 @@ def _train_cluster_search(
     )
     rows = []
     candidate_artifacts: Dict[str, str] = {}
-    minimum_size = config.model_config["constraints"]["min_cluster_size"]
+    minimum_size = (
+        config.model_config["constraints"]["min_cluster_size"]
+        if constraints_applicable
+        else None
+    )
 
     for candidate in search["candidates"]:
-        base = "models/constrained_kmeans/k_{}".format(candidate)
+        base = "models/{}/k_{}".format(model_name, candidate)
         paths = {
             "model": base + "/model.joblib",
             "assignments": base + "/train_cluster_assignments.parquet",
             "metadata": base + "/metadata.json",
         }
-        stage_key = storage.candidate_stage_key("train_model", candidate)
+        if model_name == "spectral_coclustering":
+            paths["column_labels"] = base + "/column_labels.parquet"
+            paths["model_preprocessor"] = base + "/model_preprocessor.joblib"
+        stage_key = storage.candidate_stage_key(
+            "train_model", candidate, model_name
+        )
         fingerprint = storage.candidate_training_fingerprint(config, candidate)
         candidate_exists = False
         try:
@@ -268,7 +305,7 @@ def _train_cluster_search(
                     config, stage_key, fingerprint, paths.values()
                 )
         else:
-            if candidate * minimum_size > n_train:
+            if constraints_applicable and candidate * minimum_size > n_train:
                 candidate_result = _candidate_result(
                     candidate,
                     status="skipped_infeasible",
@@ -277,6 +314,7 @@ def _train_cluster_search(
                             candidate, minimum_size, n_train
                         )
                     ),
+                    constraint_applicability="applicable",
                 )
                 storage.record_stage(
                     config,
@@ -288,10 +326,11 @@ def _train_cluster_search(
                 )
             else:
                 candidate_model_config = {
-                    "name": "constrained_kmeans",
+                    "name": model_name,
                     "parameters": dict(config.model_config["parameters"]),
-                    "constraints": config.model_config["constraints"],
                 }
+                if constraints_applicable:
+                    candidate_model_config["constraints"] = constraints
                 candidate_model_config["parameters"]["n_clusters"] = candidate
                 model = create_model(candidate_model_config)
                 started = time.perf_counter()
@@ -304,6 +343,11 @@ def _train_cluster_search(
                         status="failed",
                         failure_reason="{}: {}".format(type(exc).__name__, exc),
                         training_time_seconds=training_seconds,
+                        constraint_applicability=(
+                            "applicable"
+                            if constraints_applicable
+                            else "not applicable"
+                        ),
                     )
                     storage.record_stage(
                         config,
@@ -323,10 +367,15 @@ def _train_cluster_search(
                                 candidate
                             )
                         )
-                    violations = np.flatnonzero(counts < minimum_size) + 1
+                    violations = (
+                        np.flatnonzero(counts < minimum_size) + 1
+                        if constraints_applicable
+                        else np.array([], dtype=int)
+                    )
                     metrics = evaluation.evaluate_training_candidate(
                         train_inputs, labels, silhouette_indices
                     )
+                    model_metadata = model.metadata()
                     candidate_result = _candidate_result(
                         candidate,
                         status="success",
@@ -334,6 +383,11 @@ def _train_cluster_search(
                         training_time_seconds=training_seconds,
                         constraint_violations=int(len(violations)),
                         constraint_violation_clusters=violations.tolist(),
+                        constraint_applicability=(
+                            "applicable"
+                            if constraints_applicable
+                            else "not applicable"
+                        ),
                         training_id_fingerprint=_ids_fingerprint(
                             train_features[id_column]
                         ),
@@ -341,8 +395,18 @@ def _train_cluster_search(
                         model_parameters=json.dumps(
                             candidate_model_config["parameters"], sort_keys=True
                         ),
-                        constraints=json.dumps(
-                            candidate_model_config["constraints"], sort_keys=True
+                        constraints=(
+                            json.dumps(constraints, sort_keys=True)
+                            if constraints_applicable
+                            else None
+                        ),
+                        assignment_strategy=model_metadata.get(
+                            "assignment_strategy", "model.predict"
+                        ),
+                        model_preprocessing=model_metadata.get("preprocessing"),
+                        metric_feature_space=(
+                            "shared fitted preprocessing output: imputation=median, "
+                            "scaling={}".format(config["preprocessing"]["scaling"])
                         ),
                         **metrics
                     )
@@ -355,6 +419,26 @@ def _train_cluster_search(
                     storage.write_object(config, paths["model"], model)
                     storage.write_frame(config, paths["assignments"], assignments)
                     storage.write_json(config, paths["metadata"], candidate_result)
+                    if model_name == "spectral_coclustering":
+                        feature_names = [
+                            feature["name"] for feature in config["features"]
+                        ]
+                        storage.write_frame(
+                            config,
+                            paths["column_labels"],
+                            pd.DataFrame(
+                                {
+                                    "feature_index": np.arange(len(feature_names)),
+                                    "feature": feature_names,
+                                    "column_cluster": model.column_labels_,
+                                }
+                            ),
+                        )
+                        storage.write_object(
+                            config,
+                            paths["model_preprocessor"],
+                            model.preprocessing_,
+                        )
                     storage.record_stage(
                         config,
                         stage_key,
@@ -369,11 +453,14 @@ def _train_cluster_search(
             candidate_artifacts["assignments_k_{}".format(candidate)] = paths[
                 "assignments"
             ]
+            for key in ("column_labels", "model_preprocessor"):
+                if key in paths:
+                    candidate_artifacts["{}_k_{}".format(key, candidate)] = paths[key]
 
     comparison = pd.DataFrame(rows)
     search_fingerprint = storage.cluster_search_fingerprint(config)
-    comparison_path = "models/constrained_kmeans/search_{}/comparison.parquet".format(
-        search_fingerprint[:12]
+    comparison_path = "models/{}/search_{}/comparison.parquet".format(
+        model_name, search_fingerprint[:12]
     )
     search_stage_key = "train_model:search:{}".format(search_fingerprint[:12])
     try:
@@ -391,7 +478,9 @@ def _train_cluster_search(
             search_fingerprint,
             [comparison_path],
             {
-                storage.candidate_stage_key("train_model", candidate):
+                storage.candidate_stage_key(
+                    "train_model", candidate, model_name
+                ):
                     storage.candidate_training_fingerprint(config, candidate)
                 for candidate in search["candidates"]
             },
@@ -400,16 +489,75 @@ def _train_cluster_search(
     else:
         comparison = storage.read_frame(config, comparison_path)
     candidate_artifacts["comparison"] = comparison_path
+    selection_fingerprint = storage.selection_fingerprint(config)
+    selection_stage_key = storage.selection_stage_key(config)
+    selection_path = storage.selection_artifact_path(config)
+    try:
+        storage.require_stage(
+            config,
+            selection_stage_key,
+            selection_fingerprint,
+            [selection_path],
+        )
+        selection = storage.read_json(config, selection_path)
+    except FileNotFoundError:
+        selection_candidates = []
+        for candidate in comparison.to_dict(orient="records"):
+            candidate = dict(candidate)
+            parameters = dict(config.model_config["parameters"])
+            parameters["n_clusters"] = int(candidate["n_clusters"])
+            if not candidate.get("model_parameters"):
+                candidate["model_parameters"] = json.dumps(
+                    parameters, sort_keys=True
+                )
+            if constraints_applicable and not candidate.get("constraints"):
+                candidate["constraints"] = json.dumps(
+                    constraints, sort_keys=True
+                )
+            selection_candidates.append(candidate)
+        selection = evaluation.resolve_cluster_selection(
+            model_name,
+            selection_candidates,
+            search["selected_n_clusters"],
+            constraints,
+            constraints_applicable=constraints_applicable,
+        )
+        storage.write_json(config, selection_path, selection)
+        storage.record_stage(
+            config,
+            selection_stage_key,
+            selection_fingerprint,
+            [selection_path],
+            {search_stage_key: search_fingerprint},
+            {
+                "selection_mode": selection["selection_mode"],
+                "selected_n_clusters": selection["selected_n_clusters"],
+                "selection_rule": selection["selection_rule"],
+                "excluded_candidate_count": len(selection["excluded_candidates"]),
+            },
+        )
+    candidate_artifacts["selection"] = selection_path
+    selected_k = int(selection["selected_n_clusters"])
     selected_row = comparison.loc[
-        comparison["n_clusters"].eq(search["selected_n_clusters"])
+        comparison["n_clusters"].eq(selected_k)
     ].iloc[0]
+    if selected_row["status"] != "success":
+        raise ValueError(
+            "Selected cluster count {} was not successfully trained ({}: {}).".format(
+                selected_k,
+                selected_row["status"],
+                selected_row.get("failure_reason") or "no failure details",
+            )
+        )
     return StageResult(
         "train_model",
         candidate_artifacts,
         {
             "training_rows": n_train,
             "candidate_count": len(search["candidates"]),
-            "selected_n_clusters": search["selected_n_clusters"],
+            "selection_mode": selection["selection_mode"],
+            "selected_n_clusters": selected_k,
+            "selection_rule": selection["selection_rule"],
             "selected_status": selected_row["status"],
             "candidates": rows,
         },
@@ -448,8 +596,10 @@ def _candidate_result(
     return result
 
 
-def _candidate_training_paths(n_clusters: int) -> Tuple[str, str, str]:
-    base = "models/constrained_kmeans/k_{}".format(n_clusters)
+def _candidate_training_paths(
+    n_clusters: int, model_name: str = "constrained_kmeans"
+) -> Tuple[str, str, str]:
+    base = "models/{}/k_{}".format(model_name, n_clusters)
     return (
         base + "/model.joblib",
         base + "/train_cluster_assignments.parquet",
@@ -457,15 +607,18 @@ def _candidate_training_paths(n_clusters: int) -> Tuple[str, str, str]:
     )
 
 
-def _candidate_prototype_path(n_clusters: int) -> str:
-    return "models/constrained_kmeans/k_{}/cluster_prototypes.parquet".format(
-        n_clusters
+def _candidate_prototype_path(
+    n_clusters: int, model_name: str = "constrained_kmeans"
+) -> str:
+    return "models/{}/k_{}/cluster_prototypes.parquet".format(
+        model_name, n_clusters
     )
 
 
 def _cluster_search_comparison_path(config: LoadedConfig) -> str:
     fingerprint = storage.cluster_search_fingerprint(config)
-    return "models/constrained_kmeans/search_{}/comparison.parquet".format(
+    return "models/{}/search_{}/comparison.parquet".format(
+        config.model_config["name"],
         fingerprint[:12]
     )
 
@@ -476,8 +629,21 @@ def _cluster_search_stage_key(config: LoadedConfig) -> str:
 
 
 def _require_selected_candidate(config: LoadedConfig, n_clusters: int) -> tuple:
-    model_path, assignments_path, metadata_path = _candidate_training_paths(n_clusters)
-    key = storage.candidate_stage_key("train_model", n_clusters)
+    model_name = config.model_config["name"]
+    model_path, assignments_path, metadata_path = _candidate_training_paths(
+        n_clusters, model_name
+    )
+    required = [model_path, assignments_path, metadata_path]
+    if model_name == "spectral_coclustering":
+        required.extend(
+            [
+                "models/{}/k_{}/column_labels.parquet".format(model_name, n_clusters),
+                "models/{}/k_{}/model_preprocessor.joblib".format(
+                    model_name, n_clusters
+                ),
+            ]
+        )
+    key = storage.candidate_stage_key("train_model", n_clusters, model_name)
     fingerprint = storage.candidate_training_fingerprint(config, n_clusters)
     record = storage.require_stage(config, key, fingerprint, [])
     metadata = record.get("metadata", {})
@@ -490,7 +656,7 @@ def _require_selected_candidate(config: LoadedConfig, n_clusters: int) -> tuple:
             )
         )
     storage.require_stage(
-        config, key, fingerprint, [model_path, assignments_path, metadata_path]
+        config, key, fingerprint, required
     )
     return model_path, assignments_path, metadata_path
 
@@ -498,8 +664,9 @@ def _require_selected_candidate(config: LoadedConfig, n_clusters: int) -> tuple:
 def _require_selected_candidate_prototypes(
     config: LoadedConfig, n_clusters: int
 ) -> str:
-    path = _candidate_prototype_path(n_clusters)
-    key = storage.candidate_stage_key("build_prototypes", n_clusters)
+    model_name = config.model_config["name"]
+    path = _candidate_prototype_path(n_clusters, model_name)
+    key = storage.candidate_stage_key("build_prototypes", n_clusters, model_name)
     fingerprint = storage.candidate_prototype_fingerprint(config, n_clusters)
     storage.require_stage(config, key, fingerprint, [path])
     return path
@@ -568,7 +735,12 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
         [comparison_path],
     )
     comparison = storage.read_frame(config, comparison_path)
-    minimum_size = config.model_config["constraints"]["min_cluster_size"]
+    model_name = config.model_config["name"]
+    minimum_size = (
+        config.model_config["constraints"]["min_cluster_size"]
+        if model_name == "constrained_kmeans"
+        else 1
+    )
     artifacts: Dict[str, str] = {"comparison": comparison_path}
     candidate_summaries = []
 
@@ -576,8 +748,24 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
         candidate = int(candidate_row["n_clusters"])
         if candidate_row["status"] != "success":
             continue
-        model_path, assignment_path, metadata_path = _candidate_training_paths(candidate)
-        candidate_train_key = storage.candidate_stage_key("train_model", candidate)
+        model_path, assignment_path, metadata_path = _candidate_training_paths(
+            candidate, model_name
+        )
+        candidate_train_key = storage.candidate_stage_key(
+            "train_model", candidate, model_name
+        )
+        candidate_required = [model_path, assignment_path, metadata_path]
+        if model_name == "spectral_coclustering":
+            candidate_required.extend(
+                [
+                    "models/{}/k_{}/column_labels.parquet".format(
+                        model_name, candidate
+                    ),
+                    "models/{}/k_{}/model_preprocessor.joblib".format(
+                        model_name, candidate
+                    ),
+                ]
+            )
         candidate_train_fingerprint = storage.candidate_training_fingerprint(
             config, candidate
         )
@@ -585,7 +773,7 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
             config,
             candidate_train_key,
             candidate_train_fingerprint,
-            [model_path, assignment_path, metadata_path],
+            candidate_required,
         )
         if training_record["metadata"].get("status") != "success":
             raise ValueError(
@@ -607,8 +795,10 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
                     candidate
                 )
             )
-        prototype_path = _candidate_prototype_path(candidate)
-        prototype_key = storage.candidate_stage_key("build_prototypes", candidate)
+        prototype_path = _candidate_prototype_path(candidate, model_name)
+        prototype_key = storage.candidate_stage_key(
+            "build_prototypes", candidate, model_name
+        )
         prototype_fingerprint = storage.candidate_prototype_fingerprint(
             config, candidate
         )
@@ -651,7 +841,9 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
             }
         )
 
-    selected = search["selected_n_clusters"]
+    selected = storage.selected_candidate(config)
+    if selected is None:
+        raise RuntimeError("Cluster search did not resolve a selected candidate")
     selected_prototype_key = "prototypes_k_{}".format(selected)
     if selected_prototype_key not in artifacts:
         selected_row = comparison.loc[comparison["n_clusters"].eq(selected)].iloc[0]
@@ -663,13 +855,16 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
             )
         )
     artifacts["prototypes"] = artifacts[selected_prototype_key]
-    artifacts["assignments"] = _candidate_training_paths(selected)[1]
+    artifacts["assignments"] = _candidate_training_paths(selected, model_name)[1]
     return StageResult(
         "build_prototypes",
         artifacts,
         {
             "candidate_prototypes": candidate_summaries,
-            "selected_n_clusters": search["selected_n_clusters"],
+            "selected_n_clusters": selected,
+            "selection_mode": search["selected_n_clusters"]
+            if search["selected_n_clusters"] == "auto"
+            else "fixed",
         },
         config,
     )
@@ -690,14 +885,20 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
         scenario_dir = "transformed/{}".format(indicator_name)
         prediction_path = "predictions/test_cluster_assignments.parquet"
     else:
-        stage_key = "transform_test:k_{}:{}".format(selected_k, indicator_name)
-        scenario_dir = "transformed/constrained_kmeans/k_{}/{}".format(
-            selected_k, indicator_name
+        model_name = config.model_config["name"]
+        model_stage_id = (
+            "k_{}".format(selected_k)
+            if model_name == "constrained_kmeans"
+            else "{}:k_{}".format(model_name, selected_k)
         )
-        prediction_stage_key = "predict_test_clusters:k_{}".format(selected_k)
+        stage_key = "transform_test:{}:{}".format(model_stage_id, indicator_name)
+        scenario_dir = "transformed/{}/k_{}/{}".format(
+            model_name, selected_k, indicator_name
+        )
+        prediction_stage_key = "predict_test_clusters:{}".format(model_stage_id)
         prediction_path = (
-            "predictions/constrained_kmeans/k_{}/test_cluster_assignments.parquet".format(
-                selected_k
+            "predictions/{}/k_{}/test_cluster_assignments.parquet".format(
+                model_name, selected_k
             )
         )
     transformed_path = scenario_dir + "/transformed_test.parquet"
@@ -785,7 +986,15 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
                 "fit_preprocessor": dependencies["fit_preprocessor"],
                 "train_model": dependencies["train_model"],
             },
-            {"test_rows": len(test), "prediction_seconds": prediction_seconds},
+            {
+                "test_rows": len(test),
+                "prediction_seconds": prediction_seconds,
+                "assignment_strategy": getattr(
+                    model,
+                    "assignment_strategy",
+                    "model.predict",
+                ),
+            },
         )
     if indicator_name not in test_indicators:
         raise ValueError(
@@ -860,13 +1069,20 @@ def evaluate(config: LoadedConfig) -> StageResult:
     else:
         model_path, _, _ = _require_selected_candidate(config, selected_k)
         prototype_path = _require_selected_candidate_prototypes(config, selected_k)
-        train_record_key = storage.candidate_stage_key("train_model", selected_k)
-        prediction_record_key = "predict_test_clusters:k_{}".format(selected_k)
-        transform_record_key = "transform_test:k_{}:{}".format(
-            selected_k, config["transformation"]["selected_indicator"]
+        train_record_key = storage.candidate_stage_key(
+            "train_model", selected_k, config.model_config["name"]
         )
-        metrics_path = "metrics/constrained_kmeans/k_{}/results.json".format(
-            selected_k
+        model_stage_id = (
+            "k_{}".format(selected_k)
+            if config.model_config["name"] == "constrained_kmeans"
+            else "{}:k_{}".format(config.model_config["name"], selected_k)
+        )
+        prediction_record_key = "predict_test_clusters:{}".format(model_stage_id)
+        transform_record_key = "transform_test:{}:{}".format(
+            model_stage_id, config["transformation"]["selected_indicator"]
+        )
+        metrics_path = "metrics/{}/k_{}/results.json".format(
+            config.model_config["name"], selected_k
         )
         evaluation_stage_key = "evaluate:k_{}".format(selected_k)
     test = storage.read_frame(config, "data/test_features.parquet")
@@ -910,6 +1126,29 @@ def evaluate(config: LoadedConfig) -> StageResult:
     model_record = stage_records.get(train_record_key, {})
     prediction_record = stage_records.get(prediction_record_key, {})
     selected_record = stage_records.get(transform_record_key, {})
+    artifact_paths = [
+        "data/features.parquet",
+        "data/train_features.parquet",
+        "data/test_features.parquet",
+        "preprocessing/preprocessor.joblib",
+        model_path,
+        prototype_path,
+        transform_result.artifacts["test_assignments"],
+        transform_result.artifacts["transformed"],
+    ]
+    if config.model_config["name"] == "spectral_coclustering":
+        if selected_k is None:
+            artifact_paths.extend(
+                ["models/model_preprocessor.joblib", "models/column_labels.parquet"]
+            )
+        else:
+            base = "models/spectral_coclustering/k_{}".format(selected_k)
+            artifact_paths.extend(
+                [
+                    base + "/model_preprocessor.joblib",
+                    base + "/column_labels.parquet",
+                ]
+            )
     report = evaluation.evaluate(
         train_inputs,
         labels,
@@ -927,23 +1166,24 @@ def evaluate(config: LoadedConfig) -> StageResult:
             "prediction": prediction_record.get("metadata", {}).get("prediction_seconds"),
             "replacement": selected_record.get("metadata", {}).get("replacement_seconds"),
         },
-        artifact_sizes=storage.file_sizes(
-            config,
-            [
-                "data/features.parquet",
-                "data/train_features.parquet",
-                "data/test_features.parquet",
-                "preprocessing/preprocessor.joblib",
-                model_path,
-                prototype_path,
-                transform_result.artifacts["test_assignments"],
-                transform_result.artifacts["transformed"],
-            ],
-        ),
+        artifact_sizes=storage.file_sizes(config, artifact_paths),
     )
+    saved_model_metadata = model.metadata()
+    report["constraint_applicability"] = saved_model_metadata.get(
+        "constraint_applicability",
+        "applicable" if config.model_config["name"] == "constrained_kmeans" else "not applicable",
+    )
+    report["assignment_strategy"] = saved_model_metadata.get(
+        "assignment_strategy", "model.predict"
+    )
+    report["model_preprocessing"] = saved_model_metadata.get("preprocessing")
     storage.write_json(config, metrics_path, report)
+    comparison_markdown_path = reporting.export_overall_comparison(config, report)
+    cluster_selection_path = reporting.export_cluster_selection_comparison(
+        config, report
+    )
     fingerprint = storage.stage_fingerprint(config, "evaluate")
-    dependencies =     {
+    dependencies = {
         train_record_key: (
             storage.candidate_training_fingerprint(config, selected_k)
             if selected_k is not None
@@ -960,13 +1200,17 @@ def evaluate(config: LoadedConfig) -> StageResult:
         config,
         evaluation_stage_key,
         fingerprint,
-        [metrics_path],
+        [metrics_path, comparison_markdown_path, cluster_selection_path],
         dependencies,
         {"scenario_count": len(scenario_outputs)},
     )
     return StageResult(
         "evaluate",
-        {"metrics": metrics_path},
+        {
+            "metrics": metrics_path,
+            "overall_comparison": comparison_markdown_path,
+            "cluster_selection_comparison": cluster_selection_path,
+        },
         {
             "scenario_count": len(scenario_outputs),
             "n_clusters": len(sizes),
