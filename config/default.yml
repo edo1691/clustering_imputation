@@ -53,9 +53,6 @@ models:
   run:
     - constrained_kmeans
     - spectral_coclustering
-  configs:
-    constrained_kmeans: models/constrained_kmeans.yml
-    spectral_coclustering: models/spectral_coclustering.yml
 
 prototypes:
   aggregation: median

@@ -26,6 +26,12 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     assert (root / "prototypes/cluster_prototypes.parquet").is_file()
     assert (root / "predictions/test_cluster_assignments.parquet").is_file()
     assert (root / "metrics/results.json").is_file()
+    scale_path = root / "preprocessing/training_feature_scales.json"
+    assert scale_path.is_file()
+    scale_metadata = json.loads(scale_path.read_text(encoding="utf-8"))
+    assert scale_metadata["ddof"] == 0
+    assert scale_metadata["imputation_policy"] == "median"
+    assert scale_metadata["feature_order"] == ["ft_1", "ft_2", "ft_3"]
     comparison_path = root / "tables/overall_comparison.md"
     assert comparison_path.is_file()
     transformed = pd.read_parquet(
@@ -47,15 +53,27 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mape_status"] == (
         "unavailable_no_replaced_rows"
     )
+    assert metrics["scenarios"]["gdpr_0"]["replaced_rows_nmae"] is None
+    assert metrics["scenarios"]["gdpr_0"]["replaced_rows_nmae_status"] == (
+        "unavailable_no_replaced_rows"
+    )
     assert "overall_test_mae" in metrics["scenarios"]["gdpr_20"]
     assert "per_feature_mae" in metrics["scenarios"]["gdpr_20"]
     assert "Replaced-row MAPE excludes cells with zero original values" in metrics[
         "notes"
-    ][1]
+    ][2]
+    training = pd.read_parquet(root / "data/train_features.parquet")
+    expected_stds = {
+        name: training[name]
+        .fillna(training[name].median())
+        .std(ddof=0)
+        for name in scale_metadata["feature_order"]
+    }
+    assert scale_metadata["feature_scales"] == pytest.approx(expected_stds)
     markdown = comparison_path.read_text(encoding="utf-8")
     assert markdown.startswith("### Overall comparison of evaluated methods\n\n")
     assert (
-        "| Method | NC (%) | AP | F1 | MAE | MAPE (%) | \\|G\\| | k̄ | Time (s) |"
+        "| Method | NC (%) | AP | F1 | MAE | NMAE (train SD) ↓ | MAPE (%) | \\|G\\| | k̄ | Time (s) |"
         in markdown
     )
     table_rows = [
@@ -81,20 +99,24 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
             assert float(cells[4]) == pytest.approx(
                 scenario["replaced_rows_mae"]
             )
-        if scenario["replaced_rows_mape"] is None:
+        if scenario["replaced_rows_nmae"] is None:
             assert cells[5] == "—"
         else:
             assert float(cells[5]) == pytest.approx(
-                scenario["replaced_rows_mape"]
+                scenario["replaced_rows_nmae"]
             )
-        assert cells[6:] == [
+        if scenario["replaced_rows_mape"] is None:
+            assert cells[6] == "—"
+        else:
+            assert float(cells[6]) == pytest.approx(scenario["replaced_rows_mape"])
+        assert cells[7:] == [
             "3",
             str(int(metrics["average_training_cluster_size"])),
             str(metrics["timings_seconds"]["fitting"]),
         ]
-    assert "MAE and MAPE are calculated only for replaced rows." in markdown
-    assert "MAPE excludes cells with zero original values." in markdown
-    assert "MAE averages features on their existing scales." in markdown
+    assert "MAE, NMAE and MAPE use replaced rows only." in markdown
+    assert "Constant training features are excluded from NMAE and" in markdown
+    assert "reported separately. MAPE excludes zero original values." in markdown
     assert "Baseline" not in markdown
     assert "CC |" not in markdown
     assert "RCCC" not in markdown
@@ -138,10 +160,14 @@ def test_overall_comparison_uses_configured_range(small_config_path):
         scenario = metrics["scenarios"]["gdpr_{}".format(row[1])]
         assert row[0] == "constrained_kmeans (k=3)"
         assert float(row[4]) == pytest.approx(scenario["replaced_rows_mae"])
-        if scenario["replaced_rows_mape"] is None:
+        if scenario["replaced_rows_nmae"] is None:
             assert row[5] == "—"
         else:
-            assert float(row[5]) == pytest.approx(scenario["replaced_rows_mape"])
+            assert float(row[5]) == pytest.approx(scenario["replaced_rows_nmae"])
+        if scenario["replaced_rows_mape"] is None:
+            assert row[6] == "—"
+        else:
+            assert float(row[6]) == pytest.approx(scenario["replaced_rows_mape"])
 
     indicators = storage.read_frame(config, "data/nonconsent.parquet")
     assert indicators[["gdpr_10", "gdpr_20", "gdpr_30"]].sum().tolist() == [
@@ -511,15 +537,19 @@ def test_auto_selection_routes_all_downstream_artifacts_through_resolved_model(
     )
     model = copy.deepcopy(
         yaml.safe_load(
-            (small_search_config_path.parent / "models/search.yml").read_text(
+            (
+                small_search_config_path.parent
+                / "models/constrained_kmeans.yml"
+            ).read_text(
                 encoding="utf-8"
             )
         )
     )
     model["cluster_search"]["selected_n_clusters"] = "auto"
-    auto_model_path = small_search_config_path.parent / "models/search_auto.yml"
+    auto_model_path = (
+        small_search_config_path.parent / "models/constrained_kmeans.yml"
+    )
     auto_model_path.write_text(yaml.safe_dump(model), encoding="utf-8")
-    settings["models"]["configs"]["constrained_kmeans"] = "models/search_auto.yml"
     settings["output"]["run_name"] = "search_auto_run"
     auto_config_path = small_search_config_path.parent / "search_auto.yml"
     auto_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
@@ -602,10 +632,9 @@ def test_spectral_coclustering_runs_fixed_and_auto_pipeline_without_retraining(
             "selected_n_clusters": 2,
         },
     }
-    model_path = small_config_path.parent / "models/spectral.yml"
+    model_path = small_config_path.parent / "models/spectral_coclustering.yml"
     model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
     settings["models"]["run"] = ["spectral_coclustering"]
-    settings["models"]["configs"] = {"spectral_coclustering": "models/spectral.yml"}
     settings["output"]["run_name"] = "spectral_pipeline"
     config_path = small_config_path.parent / "spectral_run.yml"
     config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
@@ -728,7 +757,9 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
     settings = yaml.safe_load(
         small_search_config_path.read_text(encoding="utf-8")
     )
-    spectral_config_path = small_search_config_path.parent / "models/spectral.yml"
+    spectral_config_path = (
+        small_search_config_path.parent / "models/spectral_coclustering.yml"
+    )
     spectral_model = {
         "name": "spectral_coclustering",
         "parameters": {"random_state": 12345, "n_init": 2},
@@ -740,7 +771,6 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
     }
     spectral_config_path.write_text(yaml.safe_dump(spectral_model), encoding="utf-8")
     settings["models"]["run"] = ["constrained_kmeans", "spectral_coclustering"]
-    settings["models"]["configs"]["spectral_coclustering"] = "models/spectral.yml"
     settings["nonconsent"].update(
         {"start_percent": 10, "end_percent": 100, "step_percent": 10}
     )
@@ -777,6 +807,11 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
     root = config.artifact_dir
     test = pd.read_parquet(root / "data/test_features.parquet")
     indicators = pd.read_parquet(root / "data/test_indicators.parquet")
+    saved_scales = json.loads(
+        (root / "preprocessing/training_feature_scales.json").read_text(
+            encoding="utf-8"
+        )
+    )
     scenario_names = ["gdpr_{}".format(percent) for percent in range(10, 101, 10)]
     assert len(transformed_scenarios) == 20
     for model_name in ("constrained_kmeans", "spectral_coclustering"):
@@ -794,6 +829,20 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
             model_name,
             selected_k,
         ) / "results.json").is_file()
+        model_metrics = json.loads(
+            (
+                root
+                / "metrics/{}/k_{}/results.json".format(model_name, selected_k)
+            ).read_text(encoding="utf-8")
+        )
+        assert model_metrics["training_feature_scales"]["feature_stds"] == (
+            saved_scales["feature_scales"]
+        )
+        assert set(model_metrics["scenarios"]) == set(scenario_names)
+        assert all(
+            "replaced_rows_nmae" in model_metrics["scenarios"][scenario]
+            for scenario in scenario_names
+        )
         for scenario_name in scenario_names:
             base = root / "models/{}/k_{}/transformed/{}".format(
                 model_name, selected_k, scenario_name
@@ -831,6 +880,19 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
         assert [
             int(line.split("|")[2].strip()) for line in model_rows
         ] == list(range(10, 101, 10))
+        model_metrics = json.loads(
+            (
+                root
+                / "metrics/{}/k_{}/results.json".format(
+                    model_name,
+                    storage.selected_candidate(config.for_model(model_name)),
+                )
+            ).read_text(encoding="utf-8")
+        )
+        for line, scenario_name in zip(model_rows, scenario_names):
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            nmae = model_metrics["scenarios"][scenario_name]["replaced_rows_nmae"]
+            assert cells[5] == ("—" if nmae is None else str(nmae))
     cluster_report = (
         root / "tables/cluster_selection_comparison.md"
     ).read_text(encoding="utf-8")
@@ -962,9 +1024,10 @@ def test_cluster_search_builds_fitted_membership_prototypes_and_selects_without_
 
     selected_model = copy.deepcopy(small_search_config.model_config)
     selected_model["cluster_search"]["selected_n_clusters"] = 2
-    selected_model_path = small_search_config.source_path.parent / "models" / "search_select_2.yml"
+    selected_model_path = (
+        small_search_config.source_path.parent / "models" / "constrained_kmeans.yml"
+    )
     selected_model_path.write_text(yaml.safe_dump(selected_model), encoding="utf-8")
-    settings["models"]["configs"]["constrained_kmeans"] = "models/search_select_2.yml"
     selected_config_path = small_search_config.source_path.parent / "search_select_2.yml"
     selected_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
     from cluster_representation import load_config
@@ -1009,9 +1072,10 @@ def test_cluster_search_builds_fitted_membership_prototypes_and_selects_without_
     extended_model = copy.deepcopy(small_search_config.model_config)
     extended_model["cluster_search"]["candidates"] = [2, 3, 4, 20]
     extended_model["cluster_search"]["selected_n_clusters"] = 2
-    extended_model_path = small_search_config.source_path.parent / "models" / "search_extended.yml"
+    extended_model_path = (
+        small_search_config.source_path.parent / "models" / "constrained_kmeans.yml"
+    )
     extended_model_path.write_text(yaml.safe_dump(extended_model), encoding="utf-8")
-    settings["models"]["configs"]["constrained_kmeans"] = "models/search_extended.yml"
     extended_config_path = small_search_config.source_path.parent / "search_extended.yml"
     extended_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
@@ -1032,7 +1096,7 @@ def test_cluster_search_builds_fitted_membership_prototypes_and_selects_without_
     ).is_file()
     evaluation_result = stages.evaluate(extended_config)
     assert evaluation_result.artifacts["metrics"] == "metrics/constrained_kmeans/k_2/results.json"
-    assert original_model_path.name == "search.yml"
+    assert original_model_path.name == "constrained_kmeans.yml"
     assert prototypes_result.summary["selected_n_clusters"] == 3
 
 
@@ -1046,11 +1110,10 @@ def test_cluster_search_rejects_infeasible_selected_candidate_for_downstream(
     settings = yaml.safe_load(small_search_config.source_path.read_text(encoding="utf-8"))
     model = copy.deepcopy(small_search_config.model_config)
     model["cluster_search"]["selected_n_clusters"] = 20
-    model_path = small_search_config.source_path.parent / "models" / "search_select_infeasible.yml"
-    model_path.write_text(yaml.safe_dump(model), encoding="utf-8")
-    settings["models"]["configs"]["constrained_kmeans"] = (
-        "models/search_select_infeasible.yml"
+    model_path = (
+        small_search_config.source_path.parent / "models" / "constrained_kmeans.yml"
     )
+    model_path.write_text(yaml.safe_dump(model), encoding="utf-8")
     config_path = small_search_config.source_path.parent / "select_infeasible.yml"
     config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
     from cluster_representation import load_config
@@ -1159,6 +1222,7 @@ def test_metrics_handle_undefined_clustering_and_no_replacements(small_config):
         {1: 2},
         {"gdpr_0": {"requested": 0, "overall": 0, "train": 0, "test": 0}},
         small_config,
+        training_feature_stds={"ft_1": 1.0, "ft_2": 1.0, "ft_3": 1.0},
     )
     assert metrics["clustering_metrics"]["silhouette"]["value"] is None
     assert metrics["scenarios"]["gdpr_0"]["replaced_rows_mae"] is None
@@ -1201,10 +1265,28 @@ def test_replaced_row_mae_and_mape_exclude_nonreplaced_rows(small_config):
             {1: 2},
             {"gdpr_20": {"requested": 0.2, "overall": 0.2, "train": 0.2, "test": 0.2}},
             small_config,
+            training_feature_stds={"ft_1": 10.0, "ft_2": 20.0, "ft_3": 10.0},
         )["scenarios"]["gdpr_20"]
 
     result = evaluate_scenario(transformed)
     assert result["replaced_rows_mae"] == pytest.approx(3.0)
+    assert result["per_feature_replaced_rows_mae"] == {
+        "ft_1": 2.0,
+        "ft_2": 4.0,
+        "ft_3": 3.0,
+    }
+    assert result["per_feature_replaced_rows_nmae"] == {
+        "ft_1": pytest.approx(0.2),
+        "ft_2": pytest.approx(0.2),
+        "ft_3": pytest.approx(0.3),
+    }
+    assert result["replaced_rows_nmae"] == pytest.approx(7.0 / 30.0)
+    assert result["replaced_rows_nmae_status"] == "available"
+    assert result["replaced_rows_nmae_included_features"] == [
+        "ft_1",
+        "ft_2",
+        "ft_3",
+    ]
     assert result["replaced_rows_mape"] == pytest.approx(20.0)
     assert result["replaced_rows_mape_status"] == "available"
     assert result["replaced_rows_mape_valid_cells"] == 2
@@ -1222,6 +1304,9 @@ def test_replaced_row_mae_and_mape_exclude_nonreplaced_rows(small_config):
     )
     assert changed_result["replaced_rows_mape"] == pytest.approx(
         result["replaced_rows_mape"]
+    )
+    assert changed_result["replaced_rows_nmae"] == pytest.approx(
+        result["replaced_rows_nmae"]
     )
     assert changed_result["overall_test_mae"] != result["overall_test_mae"]
 
@@ -1258,6 +1343,7 @@ def test_replaced_row_mae_and_mape_exclude_nonreplaced_rows(small_config):
         {1: 2},
         {"gdpr_20": {"requested": 0.2, "overall": 0.2, "train": 0.2, "test": 0.2}},
         small_config,
+        training_feature_stds={"ft_1": 10.0, "ft_2": 20.0, "ft_3": 10.0},
     )["scenarios"]["gdpr_20"]
     assert zero_metrics["replaced_rows_mae"] == pytest.approx(2.0)
     assert zero_metrics["replaced_rows_mape"] is None
@@ -1266,3 +1352,114 @@ def test_replaced_row_mae_and_mape_exclude_nonreplaced_rows(small_config):
     )
     assert zero_metrics["replaced_rows_mape_valid_cells"] == 0
     assert zero_metrics["replaced_rows_mape_excluded_zero_cells"] == 3
+
+
+def test_nmae_normalizes_features_using_shared_training_standard_deviations(
+    small_config,
+):
+    config = copy.deepcopy(small_config)
+    config["features"].append(
+        {
+            "name": "ft_4",
+            "distribution": "normal",
+            "parameters": {"mean": 0.0, "std": 1.0},
+        }
+    )
+    original = pd.DataFrame(
+        {
+            "id_row": [1, 2],
+            "ft_1": [2000.0, -900.0],
+            "ft_2": [10.0, 1000.0],
+            "ft_3": [0.0, 2500.0],
+            "ft_4": [400.0, -3000.0],
+        }
+    )
+    transformed = original.copy()
+    transformed.loc[0, ["ft_1", "ft_2", "ft_3", "ft_4"]] = [
+        1900.0,
+        13.0,
+        100.0,
+        400.0,
+    ]
+    transformed.insert(1, "gdpr", [1, 0])
+    transformed.insert(2, "cluster", [1, 1])
+    assignments = pd.DataFrame({"id_row": [1, 2], "cluster": [1, 1]})
+    stds = {"ft_1": 500.0, "ft_2": 10.0, "ft_3": 200.0, "ft_4": 150.0}
+
+    def evaluate_scenario(frame, feature_stds, original_frame=original):
+        return evaluate(
+            [[0.0, 0.0], [1.0, 1.0]],
+            [1, 1],
+            original_frame,
+            assignments,
+            {"gdpr_20": frame},
+            {1: 2},
+            {
+                "gdpr_20": {
+                    "requested": 0.2,
+                    "overall": 0.2,
+                    "train": 0.2,
+                    "test": 0.2,
+                }
+            },
+            config,
+            training_feature_stds=feature_stds,
+        )["scenarios"]["gdpr_20"]
+
+    result = evaluate_scenario(transformed, stds)
+    assert result["per_feature_replaced_rows_mae"] == {
+        "ft_1": 100.0,
+        "ft_2": 3.0,
+        "ft_3": 100.0,
+        "ft_4": 0.0,
+    }
+    assert result["per_feature_replaced_rows_nmae"] == {
+        "ft_1": pytest.approx(0.2),
+        "ft_2": pytest.approx(0.3),
+        "ft_3": pytest.approx(0.5),
+        "ft_4": pytest.approx(0.0),
+    }
+    assert result["replaced_rows_nmae"] == pytest.approx(0.25)
+    assert result["replaced_rows_nmae_included_features"] == [
+        "ft_1",
+        "ft_2",
+        "ft_3",
+        "ft_4",
+    ]
+
+    changed_nonreplaced = transformed.copy()
+    changed_nonreplaced.loc[1, ["ft_1", "ft_2", "ft_3", "ft_4"]] = [
+        1e6,
+        -1e6,
+        1e6,
+        -1e6,
+    ]
+    assert evaluate_scenario(changed_nonreplaced, stds)[
+        "replaced_rows_nmae"
+    ] == pytest.approx(0.25)
+
+    constant_stds = dict(stds, ft_4=0.0)
+    constant_result = evaluate_scenario(transformed, constant_stds)
+    assert constant_result["per_feature_replaced_rows_mae"]["ft_4"] == 0.0
+    assert constant_result["per_feature_replaced_rows_nmae"]["ft_4"] is None
+    assert constant_result["replaced_rows_nmae"] == pytest.approx(1.0 / 3.0)
+    assert constant_result["replaced_rows_nmae_excluded_features"] == {
+        "ft_4": "zero_training_standard_deviation"
+    }
+
+    unavailable = evaluate_scenario(
+        transformed, {name: 0.0 for name in stds}
+    )
+    assert unavailable["replaced_rows_nmae"] is None
+    assert unavailable["replaced_rows_nmae_status"] == (
+        "unavailable_no_variable_training_features"
+    )
+    with pytest.raises(ValueError, match="Invalid training standard deviation.*ft_1"):
+        evaluate_scenario(transformed, dict(stds, ft_1=float("inf")))
+    nonfinite_original = original.copy()
+    nonfinite_original.loc[0, "ft_1"] = float("inf")
+    with pytest.raises(
+        ValueError,
+        match="Non-finite evaluation values for scenario 'gdpr_20'.*ft_1",
+    ):
+        evaluate_scenario(transformed, stds, nonfinite_original)

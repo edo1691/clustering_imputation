@@ -48,6 +48,16 @@ def metrics_table(metrics: Mapping[str, Any]) -> pd.DataFrame:
                 "n_replaced": values["n_replaced"],
                 "overall_test_mae": values["overall_test_mae"],
                 "replaced_rows_mae": values["replaced_rows_mae"],
+                "replaced_rows_nmae": values["replaced_rows_nmae"],
+                "replaced_rows_nmae_status": values[
+                    "replaced_rows_nmae_status"
+                ],
+                "per_feature_replaced_rows_mae": values[
+                    "per_feature_replaced_rows_mae"
+                ],
+                "per_feature_replaced_rows_nmae": values[
+                    "per_feature_replaced_rows_nmae"
+                ],
             }
         )
     return pd.DataFrame(rows)
@@ -193,6 +203,7 @@ def export_overall_comparison(
                 metrics.get("classification_metrics", {}).get("f1")
             ),
             _markdown_number(scenario_metrics.get("replaced_rows_mae")),
+            _markdown_number(scenario_metrics.get("replaced_rows_nmae")),
             _markdown_number(scenario_metrics.get("replaced_rows_mape")),
             _markdown_number(cluster_count),
             _markdown_number(metrics.get("average_training_cluster_size")),
@@ -208,13 +219,16 @@ def export_overall_comparison(
         [
             "### Overall comparison of evaluated methods",
             "",
-            "| Method | NC (%) | AP | F1 | MAE | MAPE (%) | \\|G\\| | k̄ | Time (s) |",
-            "|--------|--------|----|----|-----|----------|-------|----|----------|",
+            "| Method | NC (%) | AP | F1 | MAE | NMAE (train SD) ↓ | MAPE (%) | \\|G\\| | k̄ | Time (s) |",
+            "|--------|--------|----|----|-----|-------------------|----------|-------|----|----------|",
             *rows,
             "",
-            "MAE and MAPE are calculated only for replaced rows.",
-            "MAPE excludes cells with zero original values.",
-            "MAE averages features on their existing scales.",
+            "MAE, NMAE and MAPE use replaced rows only. NMAE is the",
+            "equal-weight mean of feature MAEs divided by their training",
+            "standard deviations (ddof=0). Lower is better. NMAE is",
+            "measured in training standard deviations, not percentages.",
+            "Constant training features are excluded from NMAE and",
+            "reported separately. MAPE excludes zero original values.",
             *([constraint_note] if constraint_note else []),
             "",
         ]

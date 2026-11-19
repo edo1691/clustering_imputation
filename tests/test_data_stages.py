@@ -44,10 +44,7 @@ def test_config_accepts_constrained_coclustering_and_rejects_trimming(
     small_config_path,
 ):
     source = yaml.safe_load(small_config_path.read_text(encoding="utf-8"))
-    source["models"] = {
-        "run": ["constrained_coclustering"],
-        "configs": {"constrained_coclustering": "models/constrained_coclustering.yml"},
-    }
+    source["models"] = {"run": ["constrained_coclustering"]}
     model_config = {
         "name": "constrained_coclustering",
         "parameters": {
@@ -87,7 +84,9 @@ def test_cluster_search_candidates_are_positive_unique_integers_and_selectable(
     settings = yaml.safe_load(
         small_search_config_path.read_text(encoding="utf-8")
     )
-    model_path = small_search_config_path.parent / "models" / "search.yml"
+    model_path = (
+        small_search_config_path.parent / "models" / "constrained_kmeans.yml"
+    )
     model_config = yaml.safe_load(model_path.read_text(encoding="utf-8"))
     model_config["cluster_search"]["candidates"] = candidates
     model_config["cluster_search"]["selected_n_clusters"] = selected
@@ -100,7 +99,9 @@ def test_cluster_search_candidates_are_positive_unique_integers_and_selectable(
 
 
 def test_cluster_search_accepts_nonconsecutive_candidates(small_search_config_path):
-    model_path = small_search_config_path.parent / "models" / "search.yml"
+    model_path = (
+        small_search_config_path.parent / "models" / "constrained_kmeans.yml"
+    )
     model_config = yaml.safe_load(model_path.read_text(encoding="utf-8"))
     model_config["cluster_search"]["candidates"] = [5, 6, 7, 8, 13, 15, 40]
     model_config["cluster_search"]["selected_n_clusters"] = 13
@@ -110,7 +111,9 @@ def test_cluster_search_accepts_nonconsecutive_candidates(small_search_config_pa
 
 
 def test_cluster_search_accepts_auto_selection(small_search_config_path):
-    model_path = small_search_config_path.parent / "models" / "search.yml"
+    model_path = (
+        small_search_config_path.parent / "models" / "constrained_kmeans.yml"
+    )
     model_config = yaml.safe_load(model_path.read_text(encoding="utf-8"))
     model_config["cluster_search"]["selected_n_clusters"] = "auto"
     model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
@@ -124,7 +127,9 @@ def test_cluster_search_accepts_auto_selection(small_search_config_path):
 def test_cluster_search_rejects_invalid_selection_values(
     small_search_config_path, selection
 ):
-    model_path = small_search_config_path.parent / "models" / "search.yml"
+    model_path = (
+        small_search_config_path.parent / "models" / "constrained_kmeans.yml"
+    )
     model_config = yaml.safe_load(model_path.read_text(encoding="utf-8"))
     model_config["cluster_search"]["selected_n_clusters"] = selection
     model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
@@ -134,7 +139,9 @@ def test_cluster_search_rejects_invalid_selection_values(
 
 
 def test_cluster_search_rejects_auto_when_disabled(small_search_config_path):
-    model_path = small_search_config_path.parent / "models" / "search.yml"
+    model_path = (
+        small_search_config_path.parent / "models" / "constrained_kmeans.yml"
+    )
     model_config = yaml.safe_load(model_path.read_text(encoding="utf-8"))
     model_config["cluster_search"]["enabled"] = False
     model_config["cluster_search"]["selected_n_clusters"] = "auto"
@@ -158,10 +165,9 @@ def test_spectral_coclustering_config_accepts_fixed_and_auto_search(
             "selected_n_clusters": selection,
         },
     }
-    model_path = small_config_path.parent / "models/spectral.yml"
+    model_path = small_config_path.parent / "models/spectral_coclustering.yml"
     model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
     settings["models"]["run"] = ["spectral_coclustering"]
-    settings["models"]["configs"] = {"spectral_coclustering": "models/spectral.yml"}
     small_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
     loaded = load_config(small_config_path)
@@ -184,10 +190,9 @@ def test_spectral_coclustering_config_rejects_unimplemented_parameters(
             "selected_n_clusters": 2,
         },
     }
-    model_path = small_config_path.parent / "models/spectral.yml"
+    model_path = small_config_path.parent / "models/spectral_coclustering.yml"
     model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
     settings["models"]["run"] = ["spectral_coclustering"]
-    settings["models"]["configs"] = {"spectral_coclustering": "models/spectral.yml"}
     small_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
     with pytest.raises(ConfigurationError, match="unknown key"):
@@ -195,38 +200,34 @@ def test_spectral_coclustering_config_rejects_unimplemented_parameters(
 
 
 @pytest.mark.parametrize(
-    "run, configs, message",
+    "run, message",
     [
-        ([], {}, "at least one"),
-        (["constrained_kmeans", "constrained_kmeans"], {}, "duplicate"),
-        (["unknown_model"], {}, "Valid model names"),
-        (["spectral_coclustering"], {}, "missing selected model"),
+        ([], "at least one"),
+        (["constrained_kmeans", "constrained_kmeans"], "duplicate"),
+        (["unknown_model"], "Valid model names"),
+        (["spectral_coclustering"], "expected file"),
     ],
 )
-def test_models_run_validation(small_config_path, run, configs, message):
+def test_models_run_validation(small_config_path, run, message):
     settings = yaml.safe_load(small_config_path.read_text(encoding="utf-8"))
-    settings["models"] = {"run": run, "configs": configs}
+    settings["models"] = {"run": run}
     small_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
     with pytest.raises(ConfigurationError, match=message):
         load_config(small_config_path)
 
 
-def test_models_run_validates_only_selected_model_configs(small_config_path):
+def test_models_run_loads_only_selected_model_configs(small_config_path):
     settings = yaml.safe_load(small_config_path.read_text(encoding="utf-8"))
-    settings["models"] = {
-        "run": ["constrained_kmeans"],
-        "configs": {
-            "constrained_kmeans": "models/constrained.yml",
-            "spectral_coclustering": "models/file-not-present.yml",
-        },
-    }
+    settings["models"] = {"run": ["constrained_kmeans"]}
     small_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
     loaded = load_config(small_config_path)
 
     assert loaded.models_run == ["constrained_kmeans"]
     assert loaded.model_config["name"] == "constrained_kmeans"
+    assert loaded.model_config_path == small_config_path.parent / "models/constrained_kmeans.yml"
+    assert "spectral_coclustering" not in loaded.model_configs
 
 
 def test_generation_reproducibility_and_independent_feature_streams(small_config):

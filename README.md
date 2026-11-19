@@ -178,10 +178,13 @@ The evaluation stage also writes `tables/overall_comparison.md` in the current
 run directory. It reports the selected constrained K-means candidate and
 configured non-consent scenario; AP and F1 are shown as unavailable because
 they are not calculated by this clustering workflow. The table's time column
-is model fitting time in seconds. Its MAE and MAPE columns are calculated only
-over replaced rows and configured features; MAPE excludes cells whose original
+is model fitting time in seconds. Its MAE, NMAE, and MAPE columns use replaced
+rows only. NMAE is the equal-weight mean of per-feature MAEs divided by
+population standard deviations from the imputed original-unit training
+features; constant features are excluded. MAPE excludes cells whose original
 value is zero. The detailed scenario results retain the all-test-row MAE and
-per-feature MAE metrics for compatibility.
+per-feature MAE metrics for compatibility. Shared scales and their imputation
+policy are saved in `preprocessing/training_feature_scales.json`.
 
 The evaluation stage also writes `tables/cluster_selection_comparison.md`,
 with one row for each successfully trained cluster-count candidate. It reads
@@ -192,22 +195,20 @@ configuration, and ties are all bolded.
 ## Spectral co-clustering
 
 To run the unconstrained scikit-learn `SpectralCoclustering` model, point the
-model name in `models.run` in `config/default.yml` and map it to its model
-configuration under `models.configs`. For example:
+model name in `models.run` in `config/default.yml`. The corresponding
+configuration is loaded automatically from `config/models/<model_name>.yml`:
 
 ```yaml
 models:
   run:
     - constrained_kmeans
     - spectral_coclustering
-  configs:
-    constrained_kmeans: models/constrained_kmeans.yml
-    spectral_coclustering: models/spectral_coclustering.yml
 ```
 
 Only models listed in `models.run` are executed, in that order. Keep each
-model's parameters and search settings in its mapped configuration file. The
-spectral model configuration supports fixed or automatic selection:
+model's parameters and search settings in its matching
+`config/models/<model_name>.yml` file. The spectral model configuration
+supports fixed or automatic selection:
 
 ```yaml
 name: spectral_coclustering

@@ -348,6 +348,7 @@ def evaluate(
     config: Mapping[str, Any],
     timings: Optional[Mapping[str, float]] = None,
     artifact_sizes: Optional[Mapping[str, int]] = None,
+    training_feature_stds: Optional[Mapping[str, float]] = None,
 ) -> Dict[str, Any]:
     labels = np.asarray(train_labels)
     model_inputs = np.asarray(train_model_inputs, dtype=float)
@@ -388,6 +389,9 @@ def evaluate(
         "artifact_sizes_bytes": dict(artifact_sizes or {}),
         "notes": [
             "Overall replacement MAE aggregates different feature scales.",
+            "NMAE is the equal-weight mean of per-feature replaced-row MAEs "
+            "divided by training standard deviations (ddof=0). Constant "
+            "training features are excluded.",
             "Replaced-row MAPE excludes cells with zero original values because "
             "percentage error is undefined for those cells.",
             "Original transactional features are accessible for cluster assignment. "
@@ -407,6 +411,32 @@ def evaluate(
         ]
     id_column = config["dataset"]["id_column"]
     feature_names = [feature["name"] for feature in config["features"]]
+    if training_feature_stds is None:
+        raise ValueError("Training feature standard deviations are required for NMAE")
+    if list(training_feature_stds) != feature_names:
+        raise ValueError(
+            "Training feature standard deviations must contain exactly the "
+            "configured features in order: {}".format(", ".join(feature_names))
+        )
+    invalid_stds = [
+        name
+        for name in feature_names
+        if not math.isfinite(float(training_feature_stds[name]))
+        or float(training_feature_stds[name]) < 0
+    ]
+    if invalid_stds:
+        raise ValueError(
+            "Invalid training standard deviation for feature(s): {}".format(
+                ", ".join(invalid_stds)
+            )
+        )
+    result["training_feature_scales"] = {
+        "feature_stds": {
+            name: float(training_feature_stds[name]) for name in feature_names
+        },
+        "ddof": 0,
+        "imputation_policy": config["preprocessing"]["imputation"],
+    }
     if test_original[id_column].tolist() != test_assignments[id_column].tolist():
         raise ValueError("Test assignments do not align with original test rows")
 
@@ -415,12 +445,33 @@ def evaluate(
             raise ValueError("{} rows do not align with original test rows".format(scenario_name))
         if transformed["gdpr"].isna().any() or not transformed["gdpr"].isin([0, 1]).all():
             raise ValueError("{} contains invalid non-consent values".format(scenario_name))
-        row_errors = np.abs(
-            transformed[feature_names].to_numpy(dtype=float)
-            - test_original[feature_names].to_numpy(dtype=float)
-        )
         original_values = test_original[feature_names].to_numpy(dtype=float)
         transformed_values = transformed[feature_names].to_numpy(dtype=float)
+        invalid_original = ~np.isfinite(original_values)
+        invalid_transformed = ~np.isfinite(transformed_values)
+        invalid_features = [
+            name
+            for index, name in enumerate(feature_names)
+            if invalid_original[:, index].any() or invalid_transformed[:, index].any()
+        ]
+        if invalid_features:
+            raise ValueError(
+                "Non-finite evaluation values for scenario {!r}, feature(s): {}".format(
+                    scenario_name, ", ".join(invalid_features)
+                )
+            )
+        row_errors = np.abs(transformed_values - original_values)
+        invalid_error_features = [
+            name
+            for index, name in enumerate(feature_names)
+            if not np.isfinite(row_errors[:, index]).all()
+        ]
+        if invalid_error_features:
+            raise ValueError(
+                "Non-finite absolute errors for scenario {!r}, feature(s): {}".format(
+                    scenario_name, ", ".join(invalid_error_features)
+                )
+            )
         replaced_mask = (
             transformed["gdpr"].to_numpy()
             == config["transformation"]["replace_when"]
@@ -441,6 +492,49 @@ def evaluate(
         valid_mape_cells = np.abs(replaced_original_values) != 0
         valid_cell_count = int(valid_mape_cells.sum())
         excluded_zero_cell_count = int(valid_mape_cells.size - valid_cell_count)
+        per_feature_replaced_mae: Dict[str, Optional[float]] = {}
+        per_feature_replaced_nmae: Dict[str, Optional[float]] = {}
+        included_features = []
+        excluded_features = {}
+        for index, name in enumerate(feature_names):
+            feature_std = float(training_feature_stds[name])
+            feature_mae = (
+                float(replaced_row_errors[:, index].mean())
+                if replaced_mask.any()
+                else None
+            )
+            per_feature_replaced_mae[name] = feature_mae
+            if feature_std == 0:
+                per_feature_replaced_nmae[name] = None
+                excluded_features[name] = "zero_training_standard_deviation"
+            elif not replaced_mask.any():
+                per_feature_replaced_nmae[name] = None
+            else:
+                normalized_mae = feature_mae / feature_std
+                if not math.isfinite(normalized_mae):
+                    raise ValueError(
+                        "Non-finite normalized MAE for scenario {!r}, feature {!r}".format(
+                            scenario_name, name
+                        )
+                    )
+                per_feature_replaced_nmae[name] = normalized_mae
+                included_features.append(name)
+        if not replaced_mask.any():
+            replaced_nmae = None
+            replaced_nmae_status = "unavailable_no_replaced_rows"
+        elif not included_features:
+            replaced_nmae = None
+            replaced_nmae_status = "unavailable_no_variable_training_features"
+        else:
+            replaced_nmae = float(
+                np.mean(
+                    [
+                        per_feature_replaced_nmae[name]
+                        for name in included_features
+                    ]
+                )
+            )
+            replaced_nmae_status = "available"
         if not replaced_mask.any():
             replaced_mape = None
             replaced_mape_status = "unavailable_no_replaced_rows"
@@ -466,6 +560,12 @@ def evaluate(
             "per_feature_mae": per_feature,
             "overall_test_mae": float(row_errors.mean()),
             "replaced_rows_mae": replaced_mae,
+            "per_feature_replaced_rows_mae": per_feature_replaced_mae,
+            "per_feature_replaced_rows_nmae": per_feature_replaced_nmae,
+            "replaced_rows_nmae": replaced_nmae,
+            "replaced_rows_nmae_status": replaced_nmae_status,
+            "replaced_rows_nmae_included_features": included_features,
+            "replaced_rows_nmae_excluded_features": excluded_features,
             "replaced_rows_mape": replaced_mape,
             "replaced_rows_mape_status": replaced_mape_status,
             "replaced_rows_mape_valid_cells": valid_cell_count,

@@ -52,12 +52,9 @@ def small_config_path(tmp_path):
             "min_cluster_size": 5,
         },
     }
-    with (models_dir / "constrained.yml").open("w", encoding="utf-8") as stream:
+    with (models_dir / "constrained_kmeans.yml").open("w", encoding="utf-8") as stream:
         yaml.safe_dump(model_config, stream)
-    source["models"] = {
-        "run": ["constrained_kmeans"],
-        "configs": {"constrained_kmeans": "models/constrained.yml"},
-    }
+    source["models"] = {"run": ["constrained_kmeans"]}
     path = config_dir / "small.yml"
     with path.open("w", encoding="utf-8") as stream:
         yaml.safe_dump(source, stream, sort_keys=False)
@@ -72,7 +69,7 @@ def small_config(small_config_path):
 @pytest.fixture
 def small_search_config_path(small_config_path):
     settings = yaml.safe_load(small_config_path.read_text(encoding="utf-8"))
-    model_path = small_config_path.parent / "models" / "search.yml"
+    model_path = small_config_path.parent / "models" / "constrained_kmeans.yml"
     model_config = {
         "name": "constrained_kmeans",
         "parameters": {
@@ -92,9 +89,6 @@ def small_search_config_path(small_config_path):
     }
     model_path.write_text(yaml.safe_dump(model_config), encoding="utf-8")
     settings["models"]["run"] = ["constrained_kmeans"]
-    settings["models"]["configs"] = {
-        "constrained_kmeans": "models/search.yml"
-    }
     settings["output"]["run_name"] = "search_run"
     small_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
     return small_config_path

@@ -122,8 +122,38 @@ def fit_preprocessor(config: LoadedConfig) -> StageResult:
     id_column = config["dataset"]["id_column"]
     names = [feature["name"] for feature in config["features"]]
     fitted = preprocessing.fit_preprocessor(train_features[names], config)
+    if fitted.imputer is None:
+        raise RuntimeError("Fitted preprocessor is missing its training imputer")
     model_path = "preprocessing/preprocessor.joblib"
     schema_path = "preprocessing/schema.json"
+    scales_path = "preprocessing/training_feature_scales.json"
+    raw_training_values = train_features[names].to_numpy(
+        dtype=float, na_value=np.nan
+    )
+    imputed_train = fitted.imputer.transform(raw_training_values)
+    scales = np.std(imputed_train, axis=0, ddof=0)
+    invalid_scales = [
+        name for name, scale in zip(names, scales) if not np.isfinite(scale)
+    ]
+    if invalid_scales:
+        raise ValueError(
+            "Non-finite training standard deviation for feature(s): {}".format(
+                ", ".join(invalid_scales)
+            )
+        )
+    scale_metadata = {
+        "feature_order": names,
+        "feature_scales": {
+            name: float(scale) for name, scale in zip(names, scales)
+        },
+        "ddof": 0,
+        "imputation_policy": config["preprocessing"]["imputation"],
+        "training_row_count": len(train_features),
+        "training_id_fingerprint": _ids_fingerprint(train_features[id_column]),
+        "constant_features": [
+            name for name, scale in zip(names, scales) if scale == 0
+        ],
+    }
     schema = {
         "id_column": id_column,
         "feature_order": names,
@@ -138,18 +168,29 @@ def fit_preprocessor(config: LoadedConfig) -> StageResult:
     }
     storage.write_object(config, model_path, fitted)
     storage.write_json(config, schema_path, schema)
+    storage.write_json(config, scales_path, scale_metadata)
     fingerprint = storage.stage_fingerprint(config, "fit_preprocessor")
     storage.record_stage(
         config,
         "fit_preprocessor",
         fingerprint,
-        [model_path, schema_path],
+        [model_path, schema_path, scales_path],
         {"split_dataset": split_fp},
-        {"feature_order": names, "training_id_count": len(train_features)},
+        {
+            "feature_order": names,
+            "training_id_count": len(train_features),
+            "training_feature_scales": scales_path,
+            "scale_ddof": 0,
+            "imputation_policy": config["preprocessing"]["imputation"],
+        },
     )
     return StageResult(
         "fit_preprocessor",
-        {"preprocessor": model_path, "schema": schema_path},
+        {
+            "preprocessor": model_path,
+            "schema": schema_path,
+            "training_feature_scales": scales_path,
+        },
         {"feature_order": names, "training_id_count": len(train_features)},
         config,
     )
@@ -978,7 +1019,10 @@ def transform_test(config: LoadedConfig) -> StageResult:
         config,
         "fit_preprocessor",
         dependencies["fit_preprocessor"],
-        ["preprocessing/preprocessor.joblib"],
+        [
+            "preprocessing/preprocessor.joblib",
+            "preprocessing/training_feature_scales.json",
+        ],
     )
     if selected_k is None:
         validate_stage_artifacts(
@@ -1136,6 +1180,26 @@ def evaluate(config: LoadedConfig) -> StageResult:
     model = storage.read_object(config, model_path)
     fitted_preprocessor = storage.read_object(config, "preprocessing/preprocessor.joblib")
     names = [feature["name"] for feature in config["features"]]
+    scale_metadata = storage.read_json(
+        config, "preprocessing/training_feature_scales.json"
+    )
+    if scale_metadata.get("feature_order") != names:
+        raise ValueError(
+            "Saved training feature scales have an incompatible feature order"
+        )
+    if scale_metadata.get("ddof") != 0:
+        raise ValueError("Saved training feature scales must use ddof=0")
+    if scale_metadata.get("imputation_policy") != config["preprocessing"]["imputation"]:
+        raise ValueError(
+            "Saved training feature scales use an incompatible imputation policy"
+        )
+    if scale_metadata.get("training_id_fingerprint") != _ids_fingerprint(
+        train[config["dataset"]["id_column"]]
+    ):
+        raise ValueError("Saved training feature scales use a different training split")
+    training_feature_stds = {
+        name: scale_metadata["feature_scales"][name] for name in names
+    }
     train_inputs = fitted_preprocessor.transform(train[names])
     labels = np.asarray(model.labels_, dtype=int)
     unique, counts = np.unique(labels, return_counts=True)
@@ -1194,6 +1258,7 @@ def evaluate(config: LoadedConfig) -> StageResult:
         "data/train_features.parquet",
         "data/test_features.parquet",
         "preprocessing/preprocessor.joblib",
+        "preprocessing/training_feature_scales.json",
         model_path,
         prototype_path,
         transform_result.artifacts["test_assignments"],
@@ -1232,6 +1297,7 @@ def evaluate(config: LoadedConfig) -> StageResult:
             ),
         },
         artifact_sizes=storage.file_sizes(config, artifact_paths),
+        training_feature_stds=training_feature_stds,
     )
     saved_model_metadata = model.metadata()
     report["constraint_applicability"] = saved_model_metadata.get(

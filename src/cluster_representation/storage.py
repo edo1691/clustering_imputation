@@ -460,6 +460,9 @@ def _atomic_write(target: Path, content: str) -> None:
 def _serializable_config(config: LoadedConfig) -> Dict[str, Any]:
     settings = json.loads(json.dumps(dict(config), default=str))
     settings["resolved_model_configs"] = config.model_configs
+    settings["resolved_model_config_paths"] = {
+        name: str(path) for name, path in config.model_config_paths.items()
+    }
     settings["models"]["run"] = list(config.models_run)
     return settings
 

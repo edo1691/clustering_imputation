@@ -90,7 +90,7 @@ class LoadedConfig(dict):
     @property
     def fingerprint(self) -> str:
         serializable = copy.deepcopy(dict(self))
-        serializable["models"]["configs"] = {
+        serializable["resolved_model_config_paths"] = {
             name: str(path) for name, path in self.model_config_paths.items()
         }
         serializable["resolved_model_configs"] = self.model_configs
@@ -526,8 +526,8 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
         raise ConfigurationError("preprocessing.scaling must be 'standard' or 'none'")
 
     models = _mapping(root["models"], "models")
-    _keys(models, {"run", "configs"}, "models")
-    _require(models, {"run", "configs"}, "models")
+    _keys(models, {"run"}, "models")
+    _require(models, {"run"}, "models")
     models_run = models["run"]
     if not isinstance(models_run, list) or not models_run:
         raise ConfigurationError("models.run must contain at least one model name")
@@ -542,21 +542,15 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
         )
     if len(set(models_run)) != len(models_run):
         raise ConfigurationError("models.run must not contain duplicate model names")
-    model_paths_config = _mapping(models["configs"], "models.configs")
-    _keys(model_paths_config, set(MODEL_NAMES), "models.configs")
     model_configs: Dict[str, Dict[str, Any]] = {}
     model_config_paths: Dict[str, Path] = {}
     for model_name in models_run:
-        if model_name not in model_paths_config:
+        model_path = (source_path.parent / "models" / (model_name + ".yml")).resolve()
+        if not model_path.is_file():
             raise ConfigurationError(
-                "models.configs is missing selected model {!r}".format(model_name)
+                "Configuration for selected model {!r} was not found; expected "
+                "file: {}".format(model_name, model_path)
             )
-        path_value = model_paths_config[model_name]
-        if not isinstance(path_value, str) or not path_value:
-            raise ConfigurationError(
-                "models.configs.{} must be a non-empty path".format(model_name)
-            )
-        model_path = (source_path.parent / path_value).resolve()
         model_config = _validate_model_config(model_path)
         if model_config["name"] != model_name:
             raise ConfigurationError(
@@ -642,9 +636,6 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
         raise ConfigurationError("output.overwrite must be boolean")
 
     normalized = copy.deepcopy(dict(root))
-    normalized["models"]["configs"] = {
-        name: str(model_config_paths[name]) for name in models_run
-    }
     normalized["output"]["root"] = str((source_path.parent / output["root"]).resolve())
     return LoadedConfig(
         normalized,
