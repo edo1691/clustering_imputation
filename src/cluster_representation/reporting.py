@@ -2,6 +2,7 @@
 
 import math
 import json
+import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -252,7 +253,7 @@ def export_overall_comparison(
             "",
         ]
     )
-    storage.write_text(config, _OVERALL_COMPARISON_PATH, content, overwrite_existing=True)
+    _write_report_with_journal(config, _OVERALL_COMPARISON_PATH, content, overwrite_existing=True)
     return _OVERALL_COMPARISON_PATH
 
 
@@ -331,7 +332,7 @@ def export_feature_evaluation(
             "unavailable (—) because the results predate per-feature evaluation."
         )
     content.append("")
-    storage.write_text(
+    _write_report_with_journal(
         config,
         _FEATURE_EVALUATION_PATH,
         "\n".join(content),
@@ -354,7 +355,7 @@ def export_multi_model_comparisons(
             "| Method | NC (%) |",
             "### Overall comparison of evaluated methods",
         )
-        storage.write_text(
+        _write_report_with_journal(
             config,
             _OVERALL_COMPARISON_PATH,
             content,
@@ -367,7 +368,7 @@ def export_multi_model_comparisons(
             "| Method | Requested k |",
             "### Cluster selection comparison",
         )
-        storage.write_text(
+        _write_report_with_journal(
             config,
             _CLUSTER_SELECTION_COMPARISON_PATH,
             content,
@@ -380,13 +381,15 @@ def export_multi_model_comparisons(
             "| Method | NC (%) | Feature |",
             "### Feature-level evaluation",
         )
-        storage.write_text(
+        _write_report_with_journal(
             config,
             _FEATURE_EVALUATION_PATH,
             content,
             overwrite_existing=True,
         )
         outputs["feature_evaluation"] = _FEATURE_EVALUATION_PATH
+    outputs.update({"journal_" + key: _journal_report_path(path)
+                    for key, path in list(outputs.items())})
     return outputs
 
 
@@ -572,7 +575,7 @@ def export_cluster_selection_comparison(
             "",
         ]
     )
-    storage.write_text(
+    _write_report_with_journal(
         config,
         _CLUSTER_SELECTION_COMPARISON_PATH,
         content,
@@ -1097,3 +1100,76 @@ def _search_comparison_path(config: LoadedConfig) -> str:
 def _search_stage_key(config: LoadedConfig) -> str:
     fingerprint = storage.cluster_search_fingerprint(config)
     return "train_model:search:{}".format(fingerprint[:12])
+
+
+def _write_report_with_journal(
+    config: LoadedConfig, path: str, content: str, overwrite_existing: bool = True
+) -> None:
+    """Write a Markdown report and its copy-ready LaTeX table."""
+    storage.write_text(config, path, content, overwrite_existing=overwrite_existing)
+    journal_path = _journal_report_path(path)
+    storage.write_text(
+        config, journal_path, _journal_table(content),
+        overwrite_existing=overwrite_existing,
+    )
+
+
+def _journal_report_path(path: str) -> str:
+    name = path.rsplit('/', 1)[-1].removesuffix('.md')
+    if name == 'cluster_selection_comparison':
+        name = 'cluster_selection_compirson'
+    return 'tables/journal_{}.tex'.format(name)
+
+
+def _journal_table(content: str) -> str:
+    """Render the report's table, preserving configuration labels and winners."""
+    replacements = {
+        '\\': r'\textbackslash{}', '&': r'\&', '%': r'\%', '$': r'\$',
+        '#': r'\#', '_': r'\_', '{': r'\{', '}': r'\}',
+        '~': r'\textasciitilde{}', '^': r'\textasciicircum{}',
+        '↑': r'$\uparrow$', '↓': r'$\downarrow$', '—': '--',
+        '–': '--', 'k̄': r'$\bar{k}$',
+    }
+
+    def cell(value: str) -> str:
+        value = value.strip().replace(r'\|', '|')
+        bold = value.startswith('**') and value.endswith('**')
+        if bold:
+            value = value[2:-2]
+        try:
+            number = float(value)
+        except ValueError:
+            pass
+        else:
+            if math.isfinite(number) and ('.' in value or 'e' in value.lower()):
+                value = '{:.3f}'.format(number)
+        escaped = re.sub(
+            r'k̄|[\\&%$#_{}~^↑↓—–]',
+            lambda match: replacements[match.group()], value,
+        )
+        return r'\textbf{' + escaped + '}' if bold else escaped
+
+    lines = [line for line in content.splitlines() if line.startswith('|')]
+    rows = [
+        [cell(value) for value in re.split(r'(?<!\\)\|', line.strip())[1:-1]]
+        for line in lines
+        if not re.fullmatch(r'[| :\-]+', line)
+    ]
+    if not rows:
+        raise ValueError('Report contains no table to export')
+    title = next(line.lstrip('# ').strip() for line in content.splitlines() if line.startswith('#'))
+    label = re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_')
+    output = [
+        r'\begin{table}[ht]', r'\centering',
+        r'\caption{' + cell(title) + '}', r'\label{tab:' + label + '}',
+        r'\footnotesize', r'\begin{tabular}{l' + 'c' * (len(rows[0]) - 1) + '}',
+        r'\hline', ' & '.join(rows[0]) + r' \\', r'\hline',
+    ]
+    previous_method = None
+    for row in rows[1:]:
+        if previous_method is not None and row[0] != previous_method:
+            output.append(r'\hline')
+        output.append(' & '.join(row) + r' \\')
+        previous_method = row[0]
+    output.extend([r'\hline', r'\end{tabular}', r'\end{table}', ''])
+    return '\n'.join(output)
