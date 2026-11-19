@@ -61,7 +61,6 @@ prototypes:
   aggregation: median
 
 transformation:
-  selected_indicator: gdpr_20
   replace_when: 1
 
 evaluation:

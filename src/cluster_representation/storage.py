@@ -83,7 +83,7 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
         settings = {
             "prediction": stage_fingerprint(config, "predict_test_clusters"),
             "prototypes": stage_fingerprint(config, "build_prototypes"),
-            "indicator": config["transformation"]["selected_indicator"],
+            "nonconsent": config["nonconsent"],
             "replace_when": config["transformation"]["replace_when"],
         }
     elif stage == "evaluate":
@@ -91,8 +91,8 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
             "training": stage_fingerprint(config, "train_model"),
             "prediction": stage_fingerprint(config, "predict_test_clusters"),
             "prototypes": stage_fingerprint(config, "build_prototypes"),
+            "transformation": stage_fingerprint(config, "transform_test"),
             "evaluation": config["evaluation"],
-            "replace_when": config["transformation"]["replace_when"],
         }
     else:
         raise ValueError("Unknown stage fingerprint: {}".format(stage))

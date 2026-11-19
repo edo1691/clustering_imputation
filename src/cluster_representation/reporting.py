@@ -846,10 +846,11 @@ def _cluster_search_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]
 
 
 def _single_model_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]]:
+    model_name = config.model_config["name"]
     metrics_path = "metrics/results.json"
     storage.require_stage(
         config,
-        "evaluate",
+        "evaluate:{}".format(model_name),
         storage.stage_fingerprint(config, "evaluate"),
         [metrics_path],
     )
@@ -869,7 +870,7 @@ def _single_model_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]]:
         scenario = scenarios[scenario_name]
         rows.append(
             {
-                "model": config.model_config["name"],
+                "model": model_name,
                 "n_clusters": n_clusters,
                 "constraint_applicability": (
                     metrics.get("constraint_applicability", "not applicable")
@@ -894,15 +895,9 @@ def _single_model_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]]:
 def _configured_scenarios(
     config: LoadedConfig, indicators: Optional[pd.DataFrame] = None
 ) -> List[Tuple[str, int]]:
-    prefix = config["nonconsent"]["prefix"]
     scenarios = []
-    settings = config["nonconsent"]
-    for percent in range(
-        settings["start_percent"],
-        settings["end_percent"] + 1,
-        settings["step_percent"],
-    ):
-        column = "{}_{}".format(prefix, percent)
+    percentages = nonconsent.scenario_percentages(config)
+    for column, percent in zip(nonconsent.scenario_columns(config), percentages):
         if indicators is not None and column not in indicators.columns:
             raise ValueError(
                 "Configured scenario {!r} is missing from saved test indicators".format(

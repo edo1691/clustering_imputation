@@ -594,20 +594,8 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
         raise ConfigurationError("prototypes.aggregation only supports 'median'")
 
     transformation = _mapping(root["transformation"], "transformation")
-    _keys(transformation, {"selected_indicator", "replace_when"}, "transformation")
-    _require(transformation, {"selected_indicator", "replace_when"}, "transformation")
-    indicator = transformation["selected_indicator"]
-    if not isinstance(indicator, str) or not re.fullmatch(
-        re.escape(nonconsent["prefix"]) + r"_(0|[1-9][0-9]*)", indicator
-    ):
-        raise ConfigurationError(
-            "transformation.selected_indicator must match <prefix>_<percentage>"
-        )
-    selected_percent = int(indicator.rsplit("_", 1)[1])
-    if not start <= selected_percent <= end or (selected_percent - start) % step:
-        raise ConfigurationError(
-            "selected_indicator percentage is not one of the configured scenarios"
-        )
+    _keys(transformation, {"replace_when"}, "transformation")
+    _require(transformation, {"replace_when"}, "transformation")
     if _integer(transformation["replace_when"], "transformation.replace_when") not in (0, 1):
         raise ConfigurationError("transformation.replace_when must be 0 or 1")
 

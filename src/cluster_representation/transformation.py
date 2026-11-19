@@ -1,6 +1,6 @@
 """Test cluster assignment and cluster-median feature replacement."""
 
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping
 
 import numpy as np
 import pandas as pd
@@ -30,11 +30,10 @@ def transform_test(
     prototypes: pd.DataFrame,
     assignments: pd.DataFrame,
     config: Mapping[str, Any],
-    indicator_name: Optional[str] = None,
+    indicator_name: str,
 ) -> Dict[str, pd.DataFrame]:
     id_column = config["dataset"]["id_column"]
     feature_names = [feature["name"] for feature in config["features"]]
-    indicator_name = indicator_name or config["transformation"]["selected_indicator"]
     _require_columns(test_features, [id_column] + feature_names, "test features")
     _require_columns(indicator_frame, [id_column, indicator_name], "test indicators")
     _require_columns(assignments, [id_column, "cluster"], "test assignments")

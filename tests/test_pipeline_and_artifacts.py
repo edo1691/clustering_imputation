@@ -29,9 +29,13 @@ def test_end_to_end_pipeline_writes_reusable_artifacts(small_config):
     comparison_path = root / "tables/overall_comparison.md"
     assert comparison_path.is_file()
     transformed = pd.read_parquet(
-        root / "transformed/gdpr_20/transformed_test.parquet"
+        root
+        / "models/constrained_kmeans/transformed/gdpr_20/transformed_test.parquet"
     )
-    originals = pd.read_parquet(root / "transformed/gdpr_20/original_test.parquet")
+    originals = pd.read_parquet(
+        root
+        / "models/constrained_kmeans/transformed/gdpr_20/original_test.parquet"
+    )
     assert transformed["id_row"].tolist() == originals["id_row"].tolist()
     assert len(transformed) == 50
 
@@ -719,7 +723,7 @@ def test_spectral_coclustering_runs_fixed_and_auto_pipeline_without_retraining(
 
 
 def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
-    small_search_config_path,
+    small_search_config_path, monkeypatch
 ):
     settings = yaml.safe_load(
         small_search_config_path.read_text(encoding="utf-8")
@@ -737,12 +741,25 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
     spectral_config_path.write_text(yaml.safe_dump(spectral_model), encoding="utf-8")
     settings["models"]["run"] = ["constrained_kmeans", "spectral_coclustering"]
     settings["models"]["configs"]["spectral_coclustering"] = "models/spectral.yml"
+    settings["nonconsent"].update(
+        {"start_percent": 10, "end_percent": 100, "step_percent": 10}
+    )
     settings["output"]["run_name"] = "multi_model_run"
     config_path = small_search_config_path.parent / "multi_model.yml"
     config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
     from cluster_representation import load_config
 
     config = load_config(config_path)
+    original_transform = transformation.transform_test
+    transformed_scenarios = []
+
+    def track_transform(*args, **kwargs):
+        transformed_scenarios.append(
+            (args[4].model_config["name"], args[5])
+        )
+        return original_transform(*args, **kwargs)
+
+    monkeypatch.setattr(transformation, "transform_test", track_transform)
     results = pipeline.run(config)
     model_training = [
         result
@@ -758,15 +775,45 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
     assert len([result for result in results if result.stage == "evaluate"]) == 2
 
     root = config.artifact_dir
+    test = pd.read_parquet(root / "data/test_features.parquet")
+    indicators = pd.read_parquet(root / "data/test_indicators.parquet")
+    scenario_names = ["gdpr_{}".format(percent) for percent in range(10, 101, 10)]
+    assert len(transformed_scenarios) == 20
     for model_name in ("constrained_kmeans", "spectral_coclustering"):
+        assert [
+            scenario for model, scenario in transformed_scenarios if model == model_name
+        ] == scenario_names
+    for model_name in ("constrained_kmeans", "spectral_coclustering"):
+        model_config = config.for_model(model_name)
+        selected_k = storage.selected_candidate(model_config)
         assert (root / "models/{}/search_{}/comparison.parquet".format(
             model_name,
-            storage.cluster_search_fingerprint(config.for_model(model_name))[:12],
+            storage.cluster_search_fingerprint(model_config)[:12],
         )).is_file()
         assert (root / "metrics/{}/k_{}".format(
             model_name,
-            storage.selected_candidate(config.for_model(model_name)),
+            selected_k,
         ) / "results.json").is_file()
+        for scenario_name in scenario_names:
+            base = root / "models/{}/k_{}/transformed/{}".format(
+                model_name, selected_k, scenario_name
+            )
+            transformed = pd.read_parquet(base / "transformed_test.parquet")
+            original = pd.read_parquet(base / "original_test.parquet")
+            assert transformed["id_row"].tolist() == test["id_row"].tolist()
+            assert original["id_row"].tolist() == test["id_row"].tolist()
+            assert transformed["gdpr"].tolist() == indicators[
+                scenario_name
+            ].tolist()
+            replaced = transformed["gdpr"].eq(1).to_numpy()
+            np.testing.assert_allclose(
+                transformed.loc[~replaced, ["ft_1", "ft_2", "ft_3"]].to_numpy(
+                    dtype=float
+                ),
+                original.loc[~replaced, ["ft_1", "ft_2", "ft_3"]].to_numpy(
+                    dtype=float
+                ),
+            )
     overall = (root / "tables/overall_comparison.md").read_text(encoding="utf-8")
     overall_rows = [
         line
@@ -774,9 +821,16 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
         if line.startswith("| constrained_kmeans")
         or line.startswith("| spectral_coclustering")
     ]
-    assert len(overall_rows) == 12
-    assert sum(line.startswith("| constrained_kmeans") for line in overall_rows) == 6
-    assert sum(line.startswith("| spectral_coclustering") for line in overall_rows) == 6
+    assert len(overall_rows) == 20
+    assert sum(line.startswith("| constrained_kmeans") for line in overall_rows) == 10
+    assert sum(line.startswith("| spectral_coclustering") for line in overall_rows) == 10
+    for model_name in ("constrained_kmeans", "spectral_coclustering"):
+        model_rows = [
+            line for line in overall_rows if line.startswith("| {}".format(model_name))
+        ]
+        assert [
+            int(line.split("|")[2].strip()) for line in model_rows
+        ] == list(range(10, 101, 10))
     cluster_report = (
         root / "tables/cluster_selection_comparison.md"
     ).read_text(encoding="utf-8")
@@ -791,7 +845,7 @@ def test_pipeline_runs_selected_models_in_order_and_combines_run_reports(
     assert "Selection mode: auto." in cluster_report
 
 
-def test_changing_selected_scenario_reuses_model_and_cluster_assignments(small_config):
+def test_transform_stage_processes_every_scenario_from_original_test_rows(small_config):
     pipeline.run(small_config)
     root = small_config.artifact_dir
     assignments_before = pd.read_parquet(
@@ -799,18 +853,36 @@ def test_changing_selected_scenario_reuses_model_and_cluster_assignments(small_c
     )
     model_path = root / "models/model.joblib"
     model_timestamp = model_path.stat().st_mtime_ns
-    alternate = copy.deepcopy(small_config)
-    alternate["transformation"]["selected_indicator"] = "gdpr_80"
-
-    result = stages.transform_test(alternate)
+    result = stages.transform_test(small_config)
 
     assignments_after = pd.read_parquet(
         root / "predictions/test_cluster_assignments.parquet"
     )
     pd.testing.assert_frame_equal(assignments_before, assignments_after)
     assert model_path.stat().st_mtime_ns == model_timestamp
-    assert result.summary["indicator"] == "gdpr_80"
-    assert (root / "transformed/gdpr_80/transformed_test.parquet").is_file()
+    scenarios = ["gdpr_{}".format(percent) for percent in range(0, 101, 20)]
+    assert result.summary["scenarios"] == scenarios
+    test = pd.read_parquet(root / "data/test_features.parquet")
+    indicators = pd.read_parquet(root / "data/test_indicators.parquet")
+    feature_names = [feature["name"] for feature in small_config["features"]]
+    for scenario in scenarios:
+        transformed_path = result.artifacts["transformed_{}".format(scenario)]
+        original_path = result.artifacts["original_{}".format(scenario)]
+        assert (root / transformed_path).is_file()
+        assert (root / original_path).is_file()
+        transformed = pd.read_parquet(root / transformed_path)
+        original = pd.read_parquet(root / original_path)
+        pd.testing.assert_frame_equal(
+            original[["id_row"] + feature_names],
+            test[["id_row"] + feature_names],
+        )
+        assert transformed["id_row"].tolist() == test["id_row"].tolist()
+        assert transformed["gdpr"].tolist() == indicators[scenario].tolist()
+        replaced = transformed["gdpr"].eq(1).to_numpy()
+        np.testing.assert_allclose(
+            transformed.loc[~replaced, feature_names].to_numpy(dtype=float),
+            original.loc[~replaced, feature_names].to_numpy(dtype=float),
+        )
 
 
 def test_cluster_search_skips_infeasible_and_separates_candidate_artifacts(
@@ -908,9 +980,11 @@ def test_cluster_search_builds_fitted_membership_prototypes_and_selects_without_
         "predictions/constrained_kmeans/k_2/test_cluster_assignments.parquet"
     )
     transformed_test = pd.read_parquet(
-        root / selected_transform.artifacts["transformed"]
+        root / selected_transform.artifacts["transformed_gdpr_20"]
     )
-    original_test = pd.read_parquet(root / selected_transform.artifacts["original"])
+    original_test = pd.read_parquet(
+        root / selected_transform.artifacts["original_gdpr_20"]
+    )
     selected_prototypes = pd.read_parquet(
         root / "models/constrained_kmeans/k_2/cluster_prototypes.parquet"
     ).set_index("cluster")

@@ -31,6 +31,15 @@ def test_config_resolves_model_and_output_paths_from_yaml(small_config):
     assert small_config.artifact_dir == small_config.source_path.parent.parent / "artifacts" / "test_run"
 
 
+def test_config_rejects_removed_single_scenario_selection(small_config_path):
+    settings = yaml.safe_load(small_config_path.read_text(encoding="utf-8"))
+    settings["transformation"]["selected_indicator"] = "gdpr_20"
+    small_config_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="transformation contains unknown key"):
+        load_config(small_config_path)
+
+
 def test_config_accepts_constrained_coclustering_and_rejects_trimming(
     small_config_path,
 ):

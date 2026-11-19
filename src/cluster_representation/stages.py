@@ -872,28 +872,17 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
 
 def transform_test(config: LoadedConfig) -> StageResult:
     config = _require_config(config)
-    transformed = _run_transformation(config, config["transformation"]["selected_indicator"])
-    return transformed
-
-
-def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResult:
     selected_k = storage.selected_candidate(config)
     fingerprint = storage.stage_fingerprint(config, "transform_test")
+    model_name = config.model_config["name"]
     if selected_k is None:
-        stage_key = "transform_test:{}".format(indicator_name)
         prediction_stage_key = "predict_test_clusters"
-        scenario_dir = "transformed/{}".format(indicator_name)
         prediction_path = "predictions/test_cluster_assignments.parquet"
     else:
-        model_name = config.model_config["name"]
         model_stage_id = (
             "k_{}".format(selected_k)
             if model_name == "constrained_kmeans"
             else "{}:k_{}".format(model_name, selected_k)
-        )
-        stage_key = "transform_test:{}:{}".format(model_stage_id, indicator_name)
-        scenario_dir = "transformed/{}/k_{}/{}".format(
-            model_name, selected_k, indicator_name
         )
         prediction_stage_key = "predict_test_clusters:{}".format(model_stage_id)
         prediction_path = (
@@ -901,34 +890,77 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
                 model_name, selected_k
             )
         )
-    transformed_path = scenario_dir + "/transformed_test.parquet"
-    original_path = scenario_dir + "/original_test.parquet"
+    stage_key = "transform_test:{}{}".format(
+        model_name,
+        ":k_{}".format(selected_k) if selected_k is not None else "",
+    )
+    transformed_prefix = "models/{}/transformed".format(model_name)
+    if selected_k is not None:
+        transformed_prefix = "models/{}/k_{}/transformed".format(
+            model_name, selected_k
+        )
     manifest_path = storage.artifact_path(config, storage.MANIFEST_NAME)
+    test_indicators = storage.read_frame(config, "data/test_indicators.parquet")
+    scenario_names = nonconsent.scenario_columns(config)
+    missing_scenarios = [
+        name for name in scenario_names if name not in test_indicators.columns
+    ]
+    if missing_scenarios:
+        raise ValueError(
+            "Configured non-consent indicator(s) are missing from saved test "
+            "indicators: {}".format(", ".join(missing_scenarios))
+        )
+    scenario_artifacts = {}
+    scenario_paths = {}
+    for indicator_name in scenario_names:
+        scenario_dir = "{}/{}".format(transformed_prefix, indicator_name)
+        transformed_path = scenario_dir + "/transformed_test.parquet"
+        original_path = scenario_dir + "/original_test.parquet"
+        scenario_paths[indicator_name] = (transformed_path, original_path)
+        scenario_artifacts["transformed_{}".format(indicator_name)] = transformed_path
+        scenario_artifacts["original_{}".format(indicator_name)] = original_path
+    required_artifacts = [
+        path
+        for paths in scenario_paths.values()
+        for path in paths
+    ] + [prediction_path]
     if manifest_path.exists():
         manifest = storage.initialize_run(config)
-        if stage_key in manifest.get("stages", {}):
+        existing_record = manifest.get("stages", {}).get(stage_key)
+        if existing_record and existing_record.get("fingerprint") == fingerprint:
             validate_stage_artifacts(
                 config,
                 stage_key,
                 fingerprint,
-                [transformed_path, original_path],
+                required_artifacts,
             )
-            frame = storage.read_frame(config, transformed_path)
+            replaced_counts = {
+                name: int(
+                    storage.read_frame(config, paths[0])["gdpr"]
+                    .eq(config["transformation"]["replace_when"])
+                    .sum()
+                )
+                for name, paths in scenario_paths.items()
+            }
             return StageResult(
                 "transform_test",
                 {
-                    "transformed": transformed_path,
-                    "original": original_path,
+                    **scenario_artifacts,
                     "test_assignments": prediction_path,
                 },
                 {
-                    "indicator": indicator_name,
-                    "test_rows": len(frame),
-                    "n_replaced": int(
-                        frame["gdpr"].eq(config["transformation"]["replace_when"]).sum()
+                    "scenarios": scenario_names,
+                    "test_rows": len(
+                        storage.read_frame(config, "data/test_features.parquet")
                     ),
+                    "n_replaced_by_scenario": replaced_counts,
                 },
                 config,
+            )
+        if existing_record and not config["output"]["overwrite"]:
+            raise ValueError(
+                "Saved transformations are incompatible with the configured NC "
+                "scenarios. Set output.overwrite=true or use a new run_name."
             )
     dependencies = {
         "split_dataset": storage.stage_fingerprint(config, "split_dataset"),
@@ -937,10 +969,15 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
         "build_prototypes": storage.stage_fingerprint(config, "build_prototypes"),
     }
     validate_stage_artifacts(
-        config, "split_dataset", dependencies["split_dataset"], ["data/test_features.parquet"]
+        config,
+        "split_dataset",
+        dependencies["split_dataset"],
+        ["data/test_features.parquet"],
     )
     validate_stage_artifacts(
-        config, "fit_preprocessor", dependencies["fit_preprocessor"],
+        config,
+        "fit_preprocessor",
+        dependencies["fit_preprocessor"],
         ["preprocessing/preprocessor.joblib"],
     )
     if selected_k is None:
@@ -948,7 +985,9 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
             config, "train_model", dependencies["train_model"], ["models/model.joblib"]
         )
         validate_stage_artifacts(
-            config, "build_prototypes", dependencies["build_prototypes"],
+            config,
+            "build_prototypes",
+            dependencies["build_prototypes"],
             ["prototypes/cluster_prototypes.parquet"],
         )
         model_path = "models/model.joblib"
@@ -957,7 +996,6 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
         model_path, _, _ = _require_selected_candidate(config, selected_k)
         prototypes_path = _require_selected_candidate_prototypes(config, selected_k)
     test = storage.read_frame(config, "data/test_features.parquet")
-    test_indicators = storage.read_frame(config, "data/test_indicators.parquet")
     prototypes_frame = storage.read_frame(config, prototypes_path)
     preprocessor = storage.read_object(config, "preprocessing/preprocessor.joblib")
     model = storage.read_object(config, model_path)
@@ -972,7 +1010,9 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
         assignments = storage.read_frame(config, prediction_path)
     except FileNotFoundError:
         prediction_started = time.perf_counter()
-        assigned = transformation.assign_test_clusters(test, config, preprocessor, model)
+        assigned = transformation.assign_test_clusters(
+            test, config, preprocessor, model
+        )
         prediction_seconds = time.perf_counter() - prediction_started
         assignments = assigned["assignments"]
         storage.write_frame(config, prediction_path, assignments)
@@ -996,53 +1036,55 @@ def _run_transformation(config: LoadedConfig, indicator_name: str) -> StageResul
                 ),
             },
         )
-    if indicator_name not in test_indicators:
-        raise ValueError(
-            "Scenario {!r} is absent from saved test indicators; run generate_dataset "
-            "and split_dataset with this scenario configured.".format(indicator_name)
+    replacement_seconds = 0.0
+    replaced_counts = {}
+    for indicator_name in scenario_names:
+        transformed_path, original_path = scenario_paths[indicator_name]
+        replacement_started = time.perf_counter()
+        transformed = transformation.transform_test(
+            test,
+            test_indicators[
+                [config["dataset"]["id_column"], indicator_name]
+            ],
+            prototypes_frame,
+            assignments,
+            config,
+            indicator_name,
         )
-    replacement_started = time.perf_counter()
-    transformed = transformation.transform_test(
-        test,
-        test_indicators[[config["dataset"]["id_column"], indicator_name]],
-        prototypes_frame,
-        assignments,
-        config,
-        indicator_name,
-    )
-    replacement_seconds = time.perf_counter() - replacement_started
-    storage.write_frame(config, transformed_path, transformed["transformed"])
-    storage.write_frame(config, original_path, transformed["original"])
+        replacement_seconds += time.perf_counter() - replacement_started
+        storage.write_frame(config, transformed_path, transformed["transformed"])
+        storage.write_frame(config, original_path, transformed["original"])
+        replaced_counts[indicator_name] = int(
+            transformed["transformed"]["gdpr"]
+            .eq(config["transformation"]["replace_when"])
+            .sum()
+        )
     storage.record_stage(
         config,
         stage_key,
         fingerprint,
-        [transformed_path, original_path, prediction_path],
+        required_artifacts,
         {
             "predict_test_clusters": prediction_fp,
             "build_prototypes": dependencies["build_prototypes"],
         },
         {
-            "indicator": indicator_name,
+            "scenarios": scenario_names,
             "test_rows": len(test),
-            "replacement_seconds": replacement_seconds,
+            "replacement_seconds_total": replacement_seconds,
+            "n_replaced_by_scenario": replaced_counts,
         },
     )
     return StageResult(
         "transform_test",
         {
-            "transformed": transformed_path,
-            "original": original_path,
+            **scenario_artifacts,
             "test_assignments": prediction_path,
         },
         {
-            "indicator": indicator_name,
+            "scenarios": scenario_names,
             "test_rows": len(test),
-            "n_replaced": int(
-                transformed["transformed"]["gdpr"].eq(
-                    config["transformation"]["replace_when"]
-                ).sum()
-            ),
+            "n_replaced_by_scenario": replaced_counts,
         },
         config,
     )
@@ -1052,42 +1094,43 @@ def evaluate(config: LoadedConfig) -> StageResult:
     config = _require_config(config)
     if not config["evaluation"]["enabled"]:
         return StageResult("evaluate", {}, {"enabled": False}, config)
-    transform_result = _run_transformation(
-        config, config["transformation"]["selected_indicator"]
-    )
+    transform_result = transform_test(config)
     selected_k = storage.selected_candidate(config)
+    model_name = config.model_config["name"]
     if selected_k is None:
         model_path = "models/model.joblib"
         prototype_path = "prototypes/cluster_prototypes.parquet"
         train_record_key = "train_model"
         prediction_record_key = "predict_test_clusters"
-        transform_record_key = "transform_test:{}".format(
-            config["transformation"]["selected_indicator"]
-        )
         metrics_path = "metrics/results.json"
-        evaluation_stage_key = "evaluate"
     else:
         model_path, _, _ = _require_selected_candidate(config, selected_k)
         prototype_path = _require_selected_candidate_prototypes(config, selected_k)
         train_record_key = storage.candidate_stage_key(
-            "train_model", selected_k, config.model_config["name"]
+            "train_model", selected_k, model_name
         )
         model_stage_id = (
             "k_{}".format(selected_k)
-            if config.model_config["name"] == "constrained_kmeans"
-            else "{}:k_{}".format(config.model_config["name"], selected_k)
+            if model_name == "constrained_kmeans"
+            else "{}:k_{}".format(model_name, selected_k)
         )
         prediction_record_key = "predict_test_clusters:{}".format(model_stage_id)
-        transform_record_key = "transform_test:{}:{}".format(
-            model_stage_id, config["transformation"]["selected_indicator"]
-        )
         metrics_path = "metrics/{}/k_{}/results.json".format(
-            config.model_config["name"], selected_k
+            model_name, selected_k
         )
-        evaluation_stage_key = "evaluate:k_{}".format(selected_k)
+    transform_record_key = "transform_test:{}{}".format(
+        model_name,
+        ":k_{}".format(selected_k) if selected_k is not None else "",
+    )
+    evaluation_stage_key = "evaluate:{}{}".format(
+        model_name,
+        ":k_{}".format(selected_k) if selected_k is not None else "",
+    )
     test = storage.read_frame(config, "data/test_features.parquet")
     test_indicators = storage.read_frame(config, "data/test_indicators.parquet")
-    assignments = storage.read_frame(config, transform_result.artifacts["test_assignments"])
+    assignments = storage.read_frame(
+        config, transform_result.artifacts["test_assignments"]
+    )
     train = storage.read_frame(config, "data/train_features.parquet")
     train_indicators = storage.read_frame(config, "data/train_indicators.parquet")
     model = storage.read_object(config, model_path)
@@ -1100,27 +1143,47 @@ def evaluate(config: LoadedConfig) -> StageResult:
     scenario_outputs = {}
     requested_rates = {}
     full_indicators = storage.read_frame(config, "data/nonconsent.parquet")
-    prototype_frame = storage.read_frame(config, prototype_path)
-    for column in test_indicators.columns:
-        if column == config["dataset"]["id_column"]:
-            continue
+    scenario_names = nonconsent.scenario_columns(config)
+    missing_scenarios = [
+        name for name in scenario_names if name not in test_indicators.columns
+    ]
+    if missing_scenarios:
+        raise ValueError(
+            "Configured non-consent indicator(s) are missing from saved test "
+            "indicators: {}".format(", ".join(missing_scenarios))
+        )
+    transformed_artifacts = []
+    id_column = config["dataset"]["id_column"]
+    for column in scenario_names:
+        transformed_path = transform_result.artifacts[
+            "transformed_{}".format(column)
+        ]
+        original_path = transform_result.artifacts["original_{}".format(column)]
+        transformed = storage.read_frame(config, transformed_path)
+        original = storage.read_frame(config, original_path)
+        if original[id_column].tolist() != test[id_column].tolist():
+            raise ValueError(
+                "Saved original rows for scenario {!r} do not align with test rows".format(
+                    column
+                )
+            )
+        if transformed[id_column].tolist() != test[id_column].tolist():
+            raise ValueError(
+                "Saved transformed rows for scenario {!r} do not align with test rows".format(
+                    column
+                )
+            )
+        scenario_outputs[column] = transformed
+        transformed_artifacts.extend([transformed_path, original_path])
+        percent = int(column.rsplit("_", 1)[1])
         requested_rates[column] = {
-            "requested": int(column.rsplit("_", 1)[1]) / 100.0,
+            "requested": percent / 100.0,
             "overall": float(
                 full_indicators[column].mean()
             ),
             "train": float(train_indicators[column].mean()),
             "test": float(test_indicators[column].mean()),
         }
-        transformed = transformation.transform_test(
-            test,
-            test_indicators[[config["dataset"]["id_column"], column]],
-            prototype_frame,
-            assignments,
-            config,
-            column,
-        )
-        scenario_outputs[column] = transformed["transformed"]
     manifest = storage.initialize_run(config)
     stage_records = manifest.get("stages", {})
     model_record = stage_records.get(train_record_key, {})
@@ -1134,9 +1197,9 @@ def evaluate(config: LoadedConfig) -> StageResult:
         model_path,
         prototype_path,
         transform_result.artifacts["test_assignments"],
-        transform_result.artifacts["transformed"],
+        *transformed_artifacts,
     ]
-    if config.model_config["name"] == "spectral_coclustering":
+    if model_name == "spectral_coclustering":
         if selected_k is None:
             artifact_paths.extend(
                 ["models/model_preprocessor.joblib", "models/column_labels.parquet"]
@@ -1164,14 +1227,16 @@ def evaluate(config: LoadedConfig) -> StageResult:
                 model_record.get("metadata", {}).get("training_time_seconds"),
             ),
             "prediction": prediction_record.get("metadata", {}).get("prediction_seconds"),
-            "replacement": selected_record.get("metadata", {}).get("replacement_seconds"),
+            "replacement": selected_record.get("metadata", {}).get(
+                "replacement_seconds_total"
+            ),
         },
         artifact_sizes=storage.file_sizes(config, artifact_paths),
     )
     saved_model_metadata = model.metadata()
     report["constraint_applicability"] = saved_model_metadata.get(
         "constraint_applicability",
-        "applicable" if config.model_config["name"] == "constrained_kmeans" else "not applicable",
+        "applicable" if model_name == "constrained_kmeans" else "not applicable",
     )
     report["assignment_strategy"] = saved_model_metadata.get(
         "assignment_strategy", "model.predict"
@@ -1190,6 +1255,7 @@ def evaluate(config: LoadedConfig) -> StageResult:
             else storage.stage_fingerprint(config, "train_model")
         ),
         "predict_test_clusters": storage.stage_fingerprint(config, "predict_test_clusters"),
+        transform_record_key: storage.stage_fingerprint(config, "transform_test"),
         "build_prototypes": (
             storage.candidate_prototype_fingerprint(config, selected_k)
             if selected_k is not None

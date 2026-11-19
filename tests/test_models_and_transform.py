@@ -166,7 +166,7 @@ def test_transform_replaces_all_features_and_preserves_others(small_config):
     )
     assignments = pd.DataFrame({"id_row": [10, 11], "cluster": [1, 2]})
     result = transform_test(
-        test, indicators, prototypes, assignments, small_config
+        test, indicators, prototypes, assignments, small_config, "gdpr_20"
     )["transformed"]
     assert result.columns.tolist() == ["id_row", "gdpr", "cluster", "ft_1", "ft_2", "ft_3"]
     assert result.loc[0, ["ft_1", "ft_2", "ft_3"]].tolist() == [1.5, 15.0, 1.5]
@@ -184,4 +184,6 @@ def test_transform_rejects_duplicate_or_missing_join_ids(small_config):
     )
     assignments = pd.DataFrame({"id_row": [1, 2], "cluster": [1, 1]})
     with pytest.raises(ValueError, match="duplicate IDs"):
-        transform_test(test, indicators, prototypes, assignments, small_config)
+        transform_test(
+            test, indicators, prototypes, assignments, small_config, "gdpr_20"
+        )

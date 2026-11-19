@@ -33,7 +33,6 @@ def small_config_path(tmp_path):
     source["nonconsent"].update(
         {"start_percent": 0, "end_percent": 100, "step_percent": 20}
     )
-    source["transformation"]["selected_indicator"] = "gdpr_20"
     source["split"]["test_size"] = 0.25
     source["output"]["root"] = "../artifacts"
     source["output"]["run_name"] = "test_run"

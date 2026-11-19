@@ -10,13 +10,24 @@ from .randomness import generator
 
 def scenario_percentages(config: Mapping[str, Any]) -> List[int]:
     settings = config["nonconsent"]
-    return list(
+    percentages = list(
         range(
             settings["start_percent"],
             settings["end_percent"] + 1,
             settings["step_percent"],
         )
     )
+    if not percentages:
+        raise ValueError("No non-consent scenarios are configured")
+    return percentages
+
+
+def scenario_columns(config: Mapping[str, Any]) -> List[str]:
+    prefix = config["nonconsent"]["prefix"]
+    return [
+        "{}_{}".format(prefix, percent)
+        for percent in scenario_percentages(config)
+    ]
 
 
 def generate_nonconsent(config: Mapping[str, Any]) -> pd.DataFrame:
