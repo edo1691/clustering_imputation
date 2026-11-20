@@ -10,7 +10,9 @@ import pandas as pd
 
 from . import nonconsent, storage, transformation
 from .config import LoadedConfig
-from .models.registry import training_constraints
+from .robust_support import uses_candidate_artifacts
+from .robust_support import ROBUST_MODELS, ClusterPair, candidate_from_record
+from .models.registry import algorithm_parameters, training_constraints
 
 
 _COMBINED_COLUMNS = [
@@ -148,7 +150,7 @@ def combined_evaluation_report(config: LoadedConfig) -> pd.DataFrame:
     if not config["evaluation"]["enabled"]:
         raise ValueError("Combined evaluation reporting is disabled by configuration")
 
-    if config.model_config.get("cluster_search", {}).get("enabled", False):
+    if uses_candidate_artifacts(config):
         rows = _cluster_search_evaluation_rows(config)
     else:
         rows = _single_model_evaluation_rows(config)
@@ -212,7 +214,7 @@ def export_overall_comparison(
         scenarios.append((percent, scenario_results[scenario_name]))
     scenarios.sort(key=lambda item: item[0])
 
-    method = "{} (k={})".format(model_name, cluster_count)
+    method = "{} (g={}, m={})".format(model_name, cluster_count, metrics["requested_column_clusters"]) if model_name in ROBUST_MODELS else "{} (k={})".format(model_name, cluster_count)
     rows = []
     for percent, scenario_metrics in scenarios:
         values = [
@@ -265,7 +267,7 @@ def export_feature_evaluation(
     model_name = config.model_config["name"]
     if "n_clusters" not in metrics:
         raise ValueError("Feature evaluation metrics are missing n_clusters")
-    method = "{} (k={})".format(model_name, metrics["n_clusters"])
+    method = "{} (g={}, m={})".format(model_name, metrics["n_clusters"], metrics["requested_column_clusters"]) if model_name in ROBUST_MODELS else "{} (k={})".format(model_name, metrics["n_clusters"])
     scenarios = metrics.get("scenarios", {})
     feature_stds = (
         metrics.get("training_feature_scales", {}).get("feature_stds", {})
@@ -416,7 +418,7 @@ def export_saved_evaluation_reports(config: LoadedConfig) -> Dict[str, str]:
         feature_reports.append(
             (config.artifact_dir / feature_path).read_text(encoding="utf-8")
         )
-        if model_config.model_config.get("cluster_search", {}).get("enabled", False):
+        if uses_candidate_artifacts(model_config):
             selection_path = export_cluster_selection_comparison(
                 model_config, metrics
             )
@@ -530,16 +532,18 @@ def export_cluster_selection_comparison(
                 if selection["selection_mode"] == "auto"
                 else "—"
             ),
-            "Yes" if record["requested_k"] == selection["selected_n_clusters"] else "No",
+            "Yes" if record["requested_k"] == selection["selected_n_clusters"] and (not selection.get("selected_pair") or record.get("requested_m") == selection["selected_pair"]["m"]) else "No",
             _markdown_number(record["training_time_seconds"]),
+            _markdown_number(record.get("requested_m")),
+            _markdown_number(record.get("actual_m")),
         ]
         rows.append("| {} |".format(" | ".join(values)))
     content = "\n".join(
         [
             "### Cluster selection comparison",
             "",
-            "| Method | Requested k | Actual clusters | Silhouette ↑ | Davies–Bouldin ↓ | Calinski–Harabasz ↑ | Selection score ↓ | Selected | Training time (s) |",
-            "|--------|-------------|-----------------|--------------|-----------------|--------------------|-------------------|----------|------------------|",
+            "| Method | Requested k | Actual clusters | Silhouette ↑ | Davies–Bouldin ↓ | Calinski–Harabasz ↑ | Selection score ↓ | Selected | Training time (s) | Requested m | Actual feature clusters |",
+            "|--------|-------------|-----------------|--------------|-----------------|--------------------|-------------------|----------|------------------|-------------|-------------------------|",
             *rows,
             "",
             "Bold values identify the best result for each metric within each method and equivalent configuration group.",
@@ -556,6 +560,7 @@ def export_cluster_selection_comparison(
                 selection["configured_selected_n_clusters"],
                 selection["selected_n_clusters"],
             ),
+            "Selected pair: {}. Requested k denotes customer groups; m denotes feature groups. Pair ties use smaller g, then smaller m. Metrics evaluate customer partitions.".format(selection.get("selected_pair")),
             "Constraint applicability: {}.".format(
                 selection.get("constraint_applicability", "applicable")
             ),
@@ -586,7 +591,7 @@ def export_cluster_selection_comparison(
 
 
 def _read_cluster_selection(config: LoadedConfig) -> Dict[str, Any]:
-    if config.model_config.get("cluster_search", {}).get("enabled", False):
+    if uses_candidate_artifacts(config):
         fingerprint = storage.selection_fingerprint(config)
         path = storage.selection_artifact_path(config)
         storage.require_stage(
@@ -597,16 +602,18 @@ def _read_cluster_selection(config: LoadedConfig) -> Dict[str, Any]:
         )
         return storage.read_json(config, path)
 
-    configured_k = int(config.model_config["parameters"]["g" if config.model_config["name"] == "robust_coclustering" else "n_clusters"])
+    parameters = algorithm_parameters(config.model_config)
+    configured_k = int(parameters["g"] if config.model_config["name"] in {"robust_coclustering", "robust_constrained_coclustering"} else parameters["n_clusters"])
     return {
         "selection_mode": "fixed",
+        "selected_pair": {"g": configured_k, "m": parameters["m"]} if config.model_config["name"] in ROBUST_MODELS else None,
         "configured_selected_n_clusters": configured_k,
         "selected_n_clusters": configured_k,
         "candidate_results": [],
         "excluded_candidates": [],
         "constraint_applicability": (
             "applicable"
-            if config.model_config["name"] in {"constrained_kmeans", "robust_coclustering"}
+            if config.model_config["name"] in {"constrained_kmeans", "robust_coclustering", "robust_constrained_coclustering"}
             else "not applicable"
         ),
     }
@@ -618,7 +625,27 @@ def _cluster_selection_records(
     selection: Mapping[str, Any],
 ) -> List[Dict[str, Any]]:
     model_name = config.model_config["name"]
-    if config.model_config.get("cluster_search", {}).get("enabled", False):
+    if model_name in ROBUST_MODELS and uses_candidate_artifacts(config):
+        comparison = storage.read_frame(config, _search_comparison_path(config))
+        by_pair = {candidate_from_record(config, row): row for row in comparison.to_dict(orient="records")}
+        records = []
+        for candidate in selection["candidate_results"]:
+            pair = ClusterPair(int(candidate["requested_n_clusters"]), int(candidate["requested_column_clusters"]))
+            row = by_pair[pair]
+            metadata = {}
+            if row["status"] == "success":
+                path = "models/{}/k_{}/metadata.json".format(model_name, pair)
+                storage.require_stage(config, storage.candidate_stage_key("train_model", pair, model_name), storage.candidate_training_fingerprint(config, pair), [path])
+                metadata = storage.read_json(config, path)
+                parameters = _metadata_mapping(metadata["model_parameters"])
+                if (parameters["g"], parameters["m"]) != pair:
+                    raise ValueError("Saved candidate parameters do not match requested pair")
+            record = _cluster_selection_record_from_candidate(model_name, candidate, row, metadata)
+            record["requested_m"] = pair.m
+            record["actual_m"] = candidate.get("actual_column_clusters") if row["status"] == "success" else None
+            records.append(record)
+        return records
+    if uses_candidate_artifacts(config):
         comparison_path = _search_comparison_path(config)
         search_fingerprint = storage.cluster_search_fingerprint(config)
         storage.require_stage(
@@ -683,7 +710,7 @@ def _cluster_selection_records(
     metadata = storage.read_json(config, "models/metadata.json")
     parameters = metadata.get("parameters", {})
     constraints = metadata.get("constraints", {})
-    requested_k = parameters.get("g" if model_name == "robust_coclustering" else "n_clusters")
+    requested_k = parameters.get("g" if model_name in {"robust_coclustering", "robust_constrained_coclustering"} else "n_clusters")
     if requested_k is None:
         raise ValueError("Saved model metadata is missing requested n_clusters")
     return [
@@ -713,7 +740,7 @@ def _cluster_selection_record_from_candidate(
         "method": method,
         "requested_k": requested_k,
         "actual_clusters": metadata.get(
-            "n_clusters", candidate.get("actual_clusters")
+            "actual_clusters", candidate.get("actual_clusters", metadata.get("n_clusters"))
         ),
         "training_time_seconds": metadata.get(
             "training_time_seconds", candidate.get("training_time_seconds")
@@ -753,6 +780,8 @@ def _cluster_selection_record(
         "method": method,
         "requested_k": int(requested_k),
         "actual_clusters": actual_clusters,
+        "requested_m": parameters.get("m"),
+        "actual_m": metadata.get("n_column_clusters"),
         "training_time_seconds": metadata.get("training_time_seconds"),
         "silhouette": _saved_metric(source, "silhouette", "silhouette_score"),
         "davies_bouldin": _saved_metric(
@@ -906,7 +935,7 @@ def _cluster_search_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]
     feature_names = [feature["name"] for feature in config["features"]]
     id_column = config["dataset"]["id_column"]
     model_name = config.model_config["name"]
-    constraints_applicable = model_name in {"constrained_kmeans", "robust_coclustering"}
+    constraints_applicable = model_name in {"constrained_kmeans", "robust_coclustering", "robust_constrained_coclustering"}
     minimum_size = (
         training_constraints(config.model_config)["min_cluster_size"]
         if constraints_applicable
@@ -917,7 +946,7 @@ def _cluster_search_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]
     for candidate in comparison.to_dict(orient="records"):
         if candidate["status"] != "success":
             continue
-        n_clusters = int(candidate["n_clusters"])
+        n_clusters = candidate_from_record(config, candidate)
         model_path = "models/{}/k_{}/model.joblib".format(model_name, n_clusters)
         assignments_path = (
             "models/{}/k_{}/train_cluster_assignments.parquet".format(
@@ -999,8 +1028,8 @@ def _cluster_search_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]
             ]
             rows.append(
                 {
-                    "model": config.model_config["name"],
-                    "n_clusters": n_clusters,
+                    "model": "{} (m={})".format(model_name, n_clusters.m) if isinstance(n_clusters, ClusterPair) else model_name,
+                    "n_clusters": n_clusters.g if isinstance(n_clusters, ClusterPair) else n_clusters,
                     "constraint_applicability": candidate.get(
                         "constraint_applicability",
                         "applicable" if constraints_applicable else "not applicable",
@@ -1050,7 +1079,7 @@ def _single_model_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]]:
         rows.append(
             {
                 "model": model_name,
-                "n_clusters": n_clusters,
+                "n_clusters": n_clusters.g if isinstance(n_clusters, ClusterPair) else n_clusters,
                 "constraint_applicability": (
                     metrics.get("constraint_applicability", "not applicable")
                 ),

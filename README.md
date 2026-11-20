@@ -250,9 +250,9 @@ all-zero future rows use the same deterministic rule. Saved active column
 labels retain scikit-learn's zero-based labels; dropped feature columns use
 `-1` in `column_labels.parquet`.
 
-The registered `constrained_coclustering` and
-`robust_constrained_coclustering` entries remain unimplemented templates;
-selecting either currently raises `NotImplementedError`.
+The registered `constrained_coclustering` entry remains an unimplemented template.
+`robust_constrained_coclustering` runs the custom robust algorithm through the
+legacy configuration mapping documented below.
 
 Because `SpectralCoclustering` has no `predict`, future customers are assigned
 to the nearest centroid of the fitted row memberships in the model's saved,
@@ -265,9 +265,8 @@ fit are reported as failed and are ineligible for automatic selection.
 AP/F1 remain unavailable because this workflow has no ground-truth customer
 class labels.
 
-`constrained_coclustering` and `robust_constrained_coclustering` remain
-configuration-only templates: their `fit()` and `predict()` methods explicitly
-raise `NotImplementedError`.
+The `constrained_coclustering` template raises `NotImplementedError` from its
+`fit()` and `predict()` methods.
 
 ## Notebooks
 
@@ -350,8 +349,13 @@ Tests cover configuration validation, reproducibility, exact scenario counts, sp
 
 ## Robust Gaussian co-clustering
 
-Add `robust_coclustering` to `models.run` in the central configuration. The
-loader automatically reads `config/models/robust_coclustering.yml`. For example:
+Select `robust_constrained_coclustering` in `models.run`. The existing alias
+`robust_coclustering` uses the same adapter, configuration validation, and
+search handling. Each name automatically loads its matching file under
+`config/models/`. The public import
+`from cluster_representation.models.robust_constrained_coclustering import RobustConstrainedCoclustering`
+is preserved. The former `models.robust_coclustering.RobustCoclustering` import
+also resolves to that class for callers and serialized artifacts.
 
 ```yaml
 models:
@@ -359,86 +363,170 @@ models:
     - constrained_kmeans
     - kmeans
     - spectral_coclustering
-    - robust_coclustering
+    - robust_constrained_coclustering
 ```
 
-Run through the normal CLI, `python -m cluster_representation --config
-config/default.yml`, after editing the model list. `kmeans` is the unconstrained
-scikit-learn baseline and uses `config/models/kmeans.yml`.
+The custom algorithm lives in
+`src/cluster_representation/models/custom/robcoclust_constrained.py`.
+Custom implementations belong in `models/custom/`; pipeline adapters remain
+in `models/`. The original algorithm's computational source is unchanged.
 
-`models/robust_coclustering.py` is a thin adapter around the original
-`models/robcoclust_constrained.py:tbcem_constrained`. The original algorithm source
-is preserved byte-for-byte. The pipeline passes the shared training-fitted median
-imputation and optional standard scaling output as a two-dimensional matrix.
-The implementation treats each customer-feature cell as univariate (`d=1`). It
-accepts signed values, so no nonnegative transform or feature removal is used.
-The common clustering metrics use that same shared feature space. The core
-algorithm also supports three-way arrays and missing cells; the pipeline uses
-its existing two-dimensional, median-imputed representation.
+The adapter uses shared training-fitted median imputation and optional standard
+scaling. Each customer-feature cell is univariate (`d=1`). Signed values are
+supported. No features are dropped. Row/customer counts use `g`; column/feature
+counts use `m`. Both counts remain fixed within one algorithm fit.
 
-The adapter passes the actual algorithm parameters through with their original
-names and defaults. `g` counts row/customer clusters and `m` counts column/feature
-clusters. With cluster search enabled, omit `g`: each candidate supplies `g`,
-while `m` and every other parameter remain fixed. Automatic selection uses the
-existing average ranks of silhouette, Davies--Bouldin and Calinski--Harabasz,
-with smaller `g` breaking ties. For fixed fitting, remove `cluster_search` and
-set `g` in `parameters`, or disable search and set a matching integer
-`selected_n_clusters`. Search candidates must be at least two for metric-based
-selection; direct fixed fitting also permits `g=1`, whose clustering metrics
-are unavailable.
+For a fixed fit, configure native parameters directly. The supplied public
+configuration preserves the previous values and disables trimming explicitly.
 
-Parameters exposed in the robust model YAML:
+```yaml
+name: robust_constrained_coclustering
+parameters:
+  g: 5
+  m: 2
+  seed: 12345
+  iter_max: 300
+  n_init: 10
+  row_size_min: 100
+  trim_lvl: 0.0
+```
 
-| Parameter | Meaning |
+Row-only search remains supported. Omit `g` when search is enabled; each
+candidate supplies it while `m` stays fixed.
+
+```yaml
+name: robust_constrained_coclustering
+parameters:
+  m: 2
+  seed: 12345
+  row_size_min: 100
+  trim_lvl: 0.10
+cluster_search:
+  enabled: true
+  candidates: [5, 10, 15]
+  selected_n_clusters: auto
+```
+
+For a grid search, omit both `g` and `m` from parameters. The following
+configuration evaluates nine pairs, one for each row/column combination.
+The remaining algorithm options can also be supplied under `parameters`.
+
+```yaml
+name: robust_constrained_coclustering
+parameters:
+  seed: 12345
+  row_size_min: 100
+  col_size_min: 1
+  trim_lvl: 0.10
+cluster_search:
+  enabled: true
+  row_candidates: [5, 10, 15]
+  column_candidates: [2, 3, 4]
+  selection: auto
+```
+
+An explicit pair selects its matching fitted model after the enabled grid has
+been evaluated. The pair must belong to the configured grid.
+
+```yaml
+cluster_search:
+  enabled: true
+  row_candidates: [5, 10, 15]
+  column_candidates: [2, 3, 4]
+  selection:
+    g: 10
+    m: 3
+```
+
+With `enabled: false`, only the explicit pair is fitted, even if candidate
+lists are present. Candidate lists can be omitted in this mode. Matching
+`parameters.g` and `parameters.m` may be supplied; conflicting values are
+rejected. Automatic selection requires enabled search.
+
+```yaml
+cluster_search:
+  enabled: false
+  selection:
+    g: 10
+    m: 3
+```
+
+Row-only `candidates`/`selected_n_clusters` settings cannot be combined with
+`row_candidates`/`column_candidates`/`selection`. Unknown keys and duplicate
+candidate counts are rejected. A fixed integer `selected_n_clusters` in an
+enabled row-only search still evaluates the configured candidates, then uses
+that count. Disabling row-only search fits its matching fixed count.
+
+Legacy `n_row_clusters`, `n_column_clusters`, `random_state`, and `max_iter`
+map explicitly to `g`, `m`, `seed`, and `iter_max`. Legacy
+`constraints.min_row_cluster_size` maps to `row_size_min`. `n_init` is preserved.
+Old and new keys with unequal values raise an error. Original migrated
+configuration values remain in model metadata. Legacy `row_fraction` and
+`column_fraction` must both be zero and map to `trim_lvl=0`. Nonzero legacy
+row/column trimming is rejected because it differs from the algorithm's cell
+trimming. Native `trim_lvl` controls cell trimming under either model name.
+
+Other native parameters retain their original meanings and defaults.
+
+| Parameter | Meaning and default |
 |---|---|
-| `g`, `m` | Separate row and column cluster counts |
-| `row_size_min`, `row_size_max` | Training row-group size bounds; null defaults to 1 and training row count |
-| `col_size_min`, `col_size_max` | Training column-group size bounds; null defaults to 1 and feature count |
+| `row_size_min`, `row_size_max` | Training row-group bounds; null defaults to 1 and the row count |
+| `col_size_min`, `col_size_max` | Training column-group bounds; null defaults to 1 and the feature count |
 | `trim_lvl` | Fraction of observed cells trimmed, default 0.10 |
-| `c` | Global covariance eigenvalue-ratio bound, null disables it |
-| `consistency` | Trimmed covariance consistency correction, default true |
+| `c` | Global covariance eigenvalue-ratio bound; null disables it |
+| `consistency` | Trimmed covariance correction, default true |
 | `n_init` | Requested random initialisations, default 10 |
-| `until_converged` | Continue initialisations until a non-degenerate run, subject to the cap |
-| `iter_max`, `tol` | Iteration cap and relative objective tolerance |
+| `until_converged` | Continue initialisations until a non-degenerate run, subject to the cap; default true |
+| `iter_max`, `tol` | Iteration cap 50 and relative objective tolerance 1e-10; null tolerance disables its check |
 | `max_init` | Total initialisation cap; null uses ten times `n_init` |
 | `max_init_attempts` | Random partition attempts per initialisation, default 50 |
-| `init_max_cells` | Robust initial-estimation subsample per block, default 500; null uses all cells |
+| `init_max_cells` | Initial-estimation subsample per block, default 500; null uses every cell |
 | `seed` | NumPy generator seed; null permits nondeterminism |
-| `verbose` | Algorithm progress-print frequency or false |
+| `verbose` | Progress-print frequency or false |
 
-Row and column size bounds are enforced by the original min-cost-flow solver.
-Row minimum/maximum bounds feed pipeline violation checks. Column counts and
-bounds are recorded in model metadata. Infeasible candidate fits and unavailable
-metrics retain the existing failure/status schema. The algorithm retains its
-own degeneracy fallback and warnings. Random partitions and subsampling use
-`seed`; multivariate MCD initialization in the original source fixes its own
-`random_state=0`. Dependencies include SciPy, scikit-learn, NumPy and OR-Tools,
-now declared explicitly where needed.
+Before fitting, candidates are checked against row and column size bounds,
+nonempty-block feasibility, and the number of observed cells retained after
+trimming. Every block needs at least two retained cells in this univariate
+pipeline. Infeasible candidates retain their pair identity and explanatory
+status. The algorithm's internal degeneracy checks and fallback warnings remain
+in effect.
 
-The user-approved out-of-sample method exists only in the adapter. It keeps
-training `w`, `mu`, `sigma` and `pi` fixed, initializes each row by maximum
-posterior, then alternates the original Mahalanobis trimming and Gaussian row
-posterior helpers until labels and mask stabilize. No model fitting or parameter
-updates occur on test rows. Failure to stabilize within `iter_max` raises an
-explicit error. No training size bounds apply to prediction batches. Trimming
-uses the whole prediction batch, so batch composition can affect assignments.
-An entirely masked row follows the fitted row proportions; ties use the lowest
-cluster index. Pipeline input validation and train-fitted imputation handle
-missing values before assignment.
+Automatic selection ranks all eligible pairs together with equal weights for
+silhouette descending, Davies--Bouldin ascending, and Calinski--Harabasz
+descending. The lowest mean rank wins. Metric ties receive average ranks;
+selection ties use smaller `g`, then smaller `m`. These metrics evaluate
+customer partitions and do not directly assess feature-cluster quality.
+Failed fits, recorded constraint violations, and unavailable/nonfinite metrics
+exclude a pair from automatic selection. An explicit selected pair must have
+fitted successfully. Selection metadata records the rule and selected pair.
 
-Training one-hot memberships are validated before converting their indices to
-one-based pipeline labels. Original `z`, `w`, `mu`, `sigma`, `pi`, `rho`, `mask`,
-score, convergence summaries and all per-initialisation `evolution` histories
-remain in `model.result_` in the joblib artifact. These histories can be large.
-Reload through the existing `ClusterModel.load` or storage workflow. Training
-IDs and feature order remain in stage metadata; column label Parquet artifacts
-also contain feature names and indices. Separate model representation metadata
-is saved beside each fitted model.
+Robust search artifacts include both counts, for example
+`models/robust_constrained_coclustering/k_g_10_m_3/`. Candidate cache keys also
+include preprocessing and non-search parameters. Incompatible cached artifacts
+are rejected. Existing fitted model joblib files remain loadable through the
+preserved adapter class path, while the previous row-only search layout should
+be regenerated in a new run directory. Search selection JSON stores
+`selected_pair` with `g` and `m`; internal `storage.selected_candidate` returns
+a `ClusterPair` for robust search, and continues to return an integer for other
+methods.
 
-Column clustering affects the Gaussian model and prediction. Downstream
-replacement uses the existing training-derived per-row-cluster feature medians,
-independently of Gaussian block means. All configured NC scenarios reuse the
-shared data split and indicators. Structured metrics, cluster-selection,
-overall and feature tables, and their journal LaTeX exports include the model.
-The overall table retains `N MAE` and omits raw MAE; raw MAE remains in structured
-and feature results.
+The selected pair supplies the matching model, feature labels, shared saved
+preprocessor, test assignments, and training-derived replacement medians.
+All NC scenarios reuse the shared split and indicators. Algorithm block means
+remain separate from downstream replacement medians. Full algorithm output,
+including `z`, `w`, `mu`, `sigma`, `pi`, `rho`, `mask`, score and all iteration
+histories, is preserved in `model.result_` inside the joblib artifact. Histories
+can consume substantial memory.
+
+Prediction retains the previously approved adapter behavior. Fitted Gaussian
+parameters, column groups and row proportions stay fixed. Maximum-posterior
+row assignments alternate with the original cell-trimming helper until labels
+and mask stabilize. No test fitting or training size bounds apply. Failure to
+stabilize within `iter_max` raises an error. Trimming is batch-wide, so batch
+composition can affect assignment. Entirely masked rows follow fitted row
+proportions, with lowest-index tie breaking.
+
+Cluster-selection reports include requested and actual customer and feature
+counts. Overall and feature reports identify both `g` and `m`. Journal LaTeX
+exports follow these tables. The overall table retains `N MAE` and omits raw
+MAE, which remains in structured and feature results.

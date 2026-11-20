@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Set
 import yaml
 
 from .models.registry import MODEL_NAMES
+from .robust_support import ROBUST_MODELS, normalize_robust_config
 
 
 PIPELINE_STEPS = (
@@ -212,8 +213,17 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
         raise ConfigurationError("Cannot read model config {}: {}".format(path, exc))
     _mapping(model, "model configuration")
     name = model.get("name")
-    if name == "robust_coclustering":
-        _keys(model, {"name", "parameters", "cluster_search"}, "model configuration")
+    if name in ROBUST_MODELS:
+        _keys(model, {"name", "parameters", "cluster_search", "constraints", "trimming"}, "model configuration")
+        _require(model, {"parameters"}, "model configuration")
+        _mapping(model["parameters"], "model.parameters")
+        for section in ("constraints", "trimming"):
+            if section in model:
+                _mapping(model[section], "model." + section)
+        try:
+            model = normalize_robust_config(model)
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
         _require(model, {"name", "parameters"}, "model configuration")
         parameters = _mapping(model["parameters"], "model.parameters")
         allowed = {
@@ -222,7 +232,7 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
             "tol", "max_init", "max_init_attempts", "init_max_cells", "seed", "verbose",
         }
         _keys(parameters, allowed, "model.parameters")
-        _require(parameters, {"m"}, "model.parameters")
+
         for key in ("g", "m", "n_init", "iter_max", "max_init_attempts"):
             if key in parameters:
                 _integer(parameters[key], "model.parameters." + key, 1)
@@ -245,35 +255,74 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
                 _number(parameters[key], "model.parameters." + key, minimum)
         search = model.get("cluster_search")
         if search is None:
-            _require(parameters, {"g"}, "model.parameters")
+            _require(parameters, {"g", "m"}, "model.parameters")
         else:
             _mapping(search, "model.cluster_search")
-            _keys(search, {"enabled", "candidates", "selected_n_clusters"}, "model.cluster_search")
-            _require(search, {"enabled", "candidates", "selected_n_clusters"}, "model.cluster_search")
-            if not isinstance(search["enabled"], bool):
+            if not isinstance(search.get("enabled"), bool):
                 raise ConfigurationError("model.cluster_search.enabled must be boolean")
-            candidates = search["candidates"]
-            if not isinstance(candidates, list) or not candidates:
-                raise ConfigurationError("model.cluster_search.candidates must be non-empty")
-            for candidate in candidates:
-                _integer(candidate, "model.cluster_search.candidate", 2)
-            if len(set(candidates)) != len(candidates):
-                raise ConfigurationError("model.cluster_search.candidates must be unique")
-            selected = search["selected_n_clusters"]
-            if selected == "auto":
-                if not search["enabled"]:
-                    raise ConfigurationError("Automatic selection requires enabled cluster search")
+            grid = any(key in search for key in ("row_candidates", "column_candidates", "selection"))
+            if grid:
+                _keys(search, {"enabled", "row_candidates", "column_candidates", "selection"}, "model.cluster_search")
+                _require(search, {"selection"}, "model.cluster_search")
+                selected = search["selection"]
+                if selected != "auto":
+                    _mapping(selected, "model.cluster_search.selection")
+                    _keys(selected, {"g", "m"}, "model.cluster_search.selection")
+                    _require(selected, {"g", "m"}, "model.cluster_search.selection")
+                    for axis in ("g", "m"):
+                        _integer(selected[axis], "model.cluster_search.selection." + axis, 1)
+                for key in ("row_candidates", "column_candidates"):
+                    if key in search:
+                        values = search[key]
+                        if not isinstance(values, list) or not values:
+                            raise ConfigurationError(key + " must be a non-empty list")
+                        for value in values:
+                            _integer(value, key, 1)
+                        if len(set(values)) != len(values):
+                            raise ConfigurationError(key + " must contain unique values")
+                if search["enabled"]:
+                    if "g" in parameters or "m" in parameters:
+                        raise ConfigurationError("Omit g and m from parameters when grid search is enabled")
+                    _require(search, {"row_candidates", "column_candidates"}, "model.cluster_search")
+                    if selected != "auto" and (selected["g"] not in search["row_candidates"] or selected["m"] not in search["column_candidates"]):
+                        raise ConfigurationError("Selected pair must belong to the configured grid")
+                    search["candidates"] = [(g, m) for g in search["row_candidates"] for m in search["column_candidates"]]
+                else:
+                    if selected == "auto":
+                        raise ConfigurationError("Disabled search requires an explicit selected pair")
+                    for axis in ("g", "m"):
+                        if axis in parameters and parameters[axis] != selected[axis]:
+                            raise ConfigurationError("Conflicting parameters and selection." + axis)
+                        parameters[axis] = selected[axis]
+                    search["candidates"] = [(selected["g"], selected["m"])]
+                search["selected_n_clusters"] = selected
+                search["mode"] = "grid"
             else:
-                _integer(selected, "model.cluster_search.selected_n_clusters", 2)
-                if selected not in candidates:
-                    raise ConfigurationError("Selected cluster count must be a candidate")
-            if search["enabled"]:
-                if "g" in parameters:
-                    raise ConfigurationError("Omit g when cluster search is enabled; candidates vary g")
-            else:
-                if "g" in parameters and parameters["g"] != selected:
-                    raise ConfigurationError("g must match selected_n_clusters")
-                parameters["g"] = selected
+                _keys(search, {"enabled", "candidates", "selected_n_clusters"}, "model.cluster_search")
+                _require(search, {"candidates", "selected_n_clusters"}, "model.cluster_search")
+                _require(parameters, {"m"}, "model.parameters")
+                candidates = search["candidates"]
+                if not isinstance(candidates, list) or not candidates:
+                    raise ConfigurationError("model.cluster_search.candidates must be non-empty")
+                for candidate in candidates:
+                    _integer(candidate, "model.cluster_search.candidate", 2)
+                if len(set(candidates)) != len(candidates):
+                    raise ConfigurationError("model.cluster_search.candidates must be unique")
+                selected = search["selected_n_clusters"]
+                if selected == "auto":
+                    if not search["enabled"]:
+                        raise ConfigurationError("Automatic selection requires enabled cluster search")
+                else:
+                    _integer(selected, "model.cluster_search.selected_n_clusters", 2)
+                    if selected not in candidates:
+                        raise ConfigurationError("Selected cluster count must be a candidate")
+                if search["enabled"]:
+                    if "g" in parameters:
+                        raise ConfigurationError("Omit g when cluster search is enabled; candidates vary g")
+                else:
+                    if "g" in parameters and parameters["g"] != selected:
+                        raise ConfigurationError("g must match selected_n_clusters")
+                    parameters["g"] = selected
         return model
     if name in {"spectral_coclustering", "kmeans"}:
         _keys(
@@ -630,10 +679,7 @@ def _validate(settings: Any, source_path: Path) -> LoadedConfig:
                 raise ConfigurationError(
                     "n_clusters * min_cluster_size exceeds the expected training row count"
                 )
-        elif model_name in {
-            "constrained_coclustering",
-            "robust_constrained_coclustering",
-        }:
+        elif model_name == "constrained_coclustering":
             params = model_config["parameters"]
             minimum = model_config["constraints"]["min_row_cluster_size"]
             if params["n_row_clusters"] * minimum > n_rows - n_test:

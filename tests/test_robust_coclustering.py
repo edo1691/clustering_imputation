@@ -8,8 +8,10 @@ import yaml
 
 from cluster_representation import load_config
 from cluster_representation import pipeline, storage
-from cluster_representation.models.robust_coclustering import RobustCoclustering
-from cluster_representation.models.robcoclust_constrained import tbcem_constrained
+from cluster_representation.models.robust_constrained_coclustering import (
+    RobustConstrainedCoclustering as RobustCoclustering,
+)
+from cluster_representation.models.custom.robcoclust_constrained import tbcem_constrained
 
 
 def test_adapter_matches_direct_call_and_reload(tmp_path):
@@ -25,7 +27,7 @@ def test_adapter_matches_direct_call_and_reload(tmp_path):
     predictions = model.predict(values[:8])
     model.save(tmp_path / "model.joblib")
     loaded = RobustCoclustering.load(tmp_path / "model.joblib")
-    with patch("cluster_representation.models.robust_coclustering.algorithm.tbcem_constrained", side_effect=AssertionError("prediction must not refit")):
+    with patch("cluster_representation.models.robust_constrained_coclustering.algorithm.tbcem_constrained", side_effect=AssertionError("prediction must not refit")):
         np.testing.assert_array_equal(predictions, loaded.predict(values[:8]))
     with pytest.raises(ValueError, match="features"):
         loaded.predict(values[:8, :2])
@@ -33,27 +35,35 @@ def test_adapter_matches_direct_call_and_reload(tmp_path):
 
 def test_adapter_rejects_soft_memberships():
     result = {"z": np.full((8, 2), 0.5), "w": np.ones((3, 1))}
-    with patch("cluster_representation.models.robust_coclustering.algorithm.tbcem_constrained", return_value=result):
+    with patch("cluster_representation.models.robust_constrained_coclustering.algorithm.tbcem_constrained", return_value=result):
         with pytest.raises(ValueError, match="hard one-hot"):
             RobustCoclustering(dict(g=2, m=1)).fit(np.ones((8, 3)))
 
 
-@pytest.mark.parametrize("mode", ["auto", "fixed_selection", "fixed_fit"])
+@pytest.mark.parametrize("mode", ["auto", "fixed_selection", "fixed_fit", "legacy"])
 def test_robust_pipeline_preserves_alignment_scenarios_and_outputs(small_config_path, mode):
     settings = yaml.safe_load(small_config_path.read_text())
     settings["features"] = [
         {"name": "ft_{}".format(i), "distribution": "normal", "parameters": {"mean": i, "std": 1 + i / 3}}
         for i in range(1, 7)
     ]
-    settings["models"]["run"] = ["robust_coclustering"]
+    model_name = "robust_constrained_coclustering" if mode == "legacy" else "robust_coclustering"
+    settings["models"]["run"] = [model_name]
     settings["output"]["run_name"] = mode
     parameters = dict(m=2, seed=12345, row_size_min=5, n_init=2, iter_max=50, max_init=4, c=100)
     model_config = {"name": "robust_coclustering", "parameters": parameters}
-    if mode == "fixed_fit":
+    if mode == "legacy":
+        model_config = {
+            "name": model_name,
+            "parameters": dict(n_row_clusters=2, n_column_clusters=2, random_state=12345, max_iter=50, n_init=2),
+            "constraints": {"min_row_cluster_size": 5},
+            "trimming": {"row_fraction": 0.0, "column_fraction": 0.0},
+        }
+    elif mode == "fixed_fit":
         parameters["g"] = 2
     else:
         model_config["cluster_search"] = {"enabled": True, "candidates": [2, 3, 100], "selected_n_clusters": "auto" if mode == "auto" else 2}
-    (small_config_path.parent / "models/robust_coclustering.yml").write_text(yaml.safe_dump(model_config))
+    (small_config_path.parent / "models" / (model_name + ".yml")).write_text(yaml.safe_dump(model_config))
     small_config_path.write_text(yaml.safe_dump(settings))
     config = load_config(small_config_path)
     results = pipeline.run(config)
@@ -66,16 +76,19 @@ def test_robust_pipeline_preserves_alignment_scenarios_and_outputs(small_config_
     assert metrics["model_metadata"]["column_constraint_violations"] == []
     assert list(metrics["training_feature_scales"]["feature_stds"]) == ["ft_{}".format(i) for i in range(1, 7)]
     selected = storage.selected_candidate(config)
-    if mode == "fixed_fit":
+    if mode in {"fixed_fit", "legacy"}:
         base = "models"
     else:
         selection = storage.read_json(config, storage.selection_artifact_path(config))
-        assert selected in (2, 3)
+        assert selected.g in (2, 3) and selected.m == 2
         assert selection["excluded_candidates"][0]["requested_n_clusters"] == 100
         keys = [candidate["configuration_key"] for candidate in selection["candidate_results"][:2]]
         assert keys[0] == keys[1], "g must vary within a common ranking group"
         base = "models/robust_coclustering/k_{}".format(selected)
     model = storage.read_object(config, base + "/model.joblib")
+    if mode == "legacy":
+        assert model.parameters == dict(g=2, m=2, seed=12345, iter_max=50, n_init=2, row_size_min=5, trim_lvl=0.0)
+        assert model.metadata()["integration_config"] == model_config
     columns = storage.read_frame(config, base + "/column_labels.parquet")
     assert columns["feature"].tolist() == ["ft_{}".format(i) for i in range(1, 7)]
     np.testing.assert_array_equal(columns["column_cluster"], model.column_labels_)
@@ -91,7 +104,7 @@ def test_robust_pipeline_preserves_alignment_scenarios_and_outputs(small_config_
         retained = output["gdpr"].eq(0)
         np.testing.assert_allclose(output.loc[retained, columns["feature"].tolist()], test.loc[retained, columns["feature"].tolist()])
     for report in ("cluster_selection_comparison", "overall_comparison", "feature_evaluation"):
-        assert "robust_coclustering" in (config.artifact_dir / "tables" / (report + ".md")).read_text()
+        assert model_name in (config.artifact_dir / "tables" / (report + ".md")).read_text()
     overall = (config.artifact_dir / "tables/overall_comparison.md").read_text()
     assert "N MAE" in overall and "| MAE |" not in overall
 

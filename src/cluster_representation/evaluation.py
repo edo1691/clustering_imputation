@@ -5,6 +5,7 @@ import math
 from typing import Any, Dict, List, Mapping, Optional
 
 from .models.registry import training_constraints
+from .robust_support import ROBUST_MODELS
 
 import numpy as np
 import pandas as pd
@@ -39,8 +40,9 @@ def resolve_cluster_selection(
         requested_k = int(candidate["n_clusters"])
         parameters = _selection_mapping(candidate.get("model_parameters"))
         parameters.pop("n_clusters", None)
-        if method == "robust_coclustering":
+        if method in ROBUST_MODELS:
             parameters.pop("g", None)
+            parameters.pop("m", None)
         candidate_constraints = _selection_mapping(candidate.get("constraints"))
         if not candidate_constraints and constraints_applicable:
             candidate_constraints = dict(constraints)
@@ -58,6 +60,9 @@ def resolve_cluster_selection(
         )
         candidate_result = {
             "requested_n_clusters": requested_k,
+            "requested_row_clusters": requested_k,
+            "requested_column_clusters": int(candidate["requested_column_clusters"]) if method in ROBUST_MODELS else None,
+            "actual_column_clusters": int(candidate["actual_column_clusters"]) if method in ROBUST_MODELS and candidate.get("status") == "success" else None,
             "actual_clusters": (
                 int(candidate.get("actual_clusters", candidate["n_clusters"]))
                 if candidate.get("status") == "success"
@@ -134,13 +139,15 @@ def resolve_cluster_selection(
             key=lambda item: (
                 item["selection_score"],
                 item["requested_n_clusters"],
+                item.get("requested_column_clusters") or 0,
             ),
         )
         selected_n_clusters = int(winner["requested_n_clusters"])
     else:
-        selected_n_clusters = int(configured_selection)
+        selected_n_clusters = int(configured_selection["g"] if isinstance(configured_selection, dict) else configured_selection)
         if not any(
             item["requested_n_clusters"] == selected_n_clusters
+            and (not isinstance(configured_selection, dict) or item["requested_column_clusters"] == configured_selection["m"])
             for item in candidate_results
         ):
             raise ValueError(
@@ -149,12 +156,24 @@ def resolve_cluster_selection(
                 )
             )
 
+    selected_pair = None
+    if method in ROBUST_MODELS:
+        if selection_mode == "auto":
+            selected_record = winner
+        else:
+            selected_record = next(item for item in candidate_results
+                if item["requested_n_clusters"] == selected_n_clusters
+                and (not isinstance(configured_selection, dict) or item["requested_column_clusters"] == configured_selection["m"]))
+        if selected_record["status"] != "success" or selected_record["exclusion_reasons"] and selection_mode == "auto":
+            raise ValueError("Selected pair g={} m={} did not fit successfully: {}".format(selected_n_clusters, selected_record["requested_column_clusters"], "; ".join(selected_record["exclusion_reasons"])))
+        selected_pair = {"g": selected_n_clusters, "m": int(selected_record["requested_column_clusters"])}
     return {
         "method": method,
+        "selected_pair": selected_pair,
         "selection_mode": selection_mode,
         "configured_selected_n_clusters": configured_selection,
         "selected_n_clusters": selected_n_clusters,
-        "selection_rule": CLUSTER_SELECTION_RULE,
+        "selection_rule": (CLUSTER_SELECTION_RULE + " Pair ties use smaller g, then smaller m. Metrics evaluate customer partitions only.") if method in ROBUST_MODELS else CLUSTER_SELECTION_RULE,
         "constraint_applicability": (
             "applicable" if constraints_applicable else "not applicable"
         ),
@@ -162,6 +181,7 @@ def resolve_cluster_selection(
         "excluded_candidates": [
             {
                 "requested_n_clusters": item["requested_n_clusters"],
+                "requested_column_clusters": item.get("requested_column_clusters"),
                 "reasons": item["exclusion_reasons"],
             }
             for item in candidate_results

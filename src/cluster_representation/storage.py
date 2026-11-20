@@ -18,6 +18,8 @@ import sklearn
 import yaml
 
 from .config import LoadedConfig
+from .robust_support import uses_candidate_artifacts
+from .robust_support import ROBUST_MODELS, ClusterPair, search_candidates
 
 
 MANIFEST_NAME = "manifest.json"
@@ -50,15 +52,15 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
         model_settings = config.model_config
         if (
             model_settings["name"]
-            in {"constrained_kmeans", "spectral_coclustering", "robust_coclustering", "kmeans"}
-            and model_settings.get("cluster_search", {}).get("enabled", False)
+            in {"constrained_kmeans", "spectral_coclustering", "robust_coclustering", "robust_constrained_coclustering", "kmeans"}
+            and uses_candidate_artifacts(config)
         ):
             model_settings = {
                 "name": model_settings["name"],
                 "parameters": {
                     key: value
                     for key, value in model_settings["parameters"].items()
-                    if key not in {"n_clusters", "g"}
+                    if key not in ({"g", "m"} if model_settings["name"] in ROBUST_MODELS else {"n_clusters"})
                 },
             }
             if "constraints" in config.model_config:
@@ -104,9 +106,9 @@ def selected_candidate(config: LoadedConfig) -> Optional[int]:
     search = config.model_config.get("cluster_search")
     if (
         config.model_config["name"]
-        in {"constrained_kmeans", "spectral_coclustering", "robust_coclustering", "kmeans"}
+        in {"constrained_kmeans", "spectral_coclustering", "robust_coclustering", "robust_constrained_coclustering", "kmeans"}
         and search
-        and search["enabled"]
+        and uses_candidate_artifacts(config)
     ):
         selection_path = selection_artifact_path(config)
         if not artifact_path(config, selection_path).is_file():
@@ -139,6 +141,9 @@ def selected_candidate(config: LoadedConfig) -> Optional[int]:
                 "for configured selection {!r}.".format(configured_k)
             )
         selection = read_json(config, selection_path)
+        if config.model_config["name"] in ROBUST_MODELS:
+            pair = selection["selected_pair"]
+            return ClusterPair(pair["g"], pair["m"])
         return int(selection["selected_n_clusters"])
     return None
 
@@ -151,11 +156,13 @@ def candidate_training_fingerprint(config: LoadedConfig, n_clusters: int) -> str
         "parameters": {
             key: value
             for key, value in model["parameters"].items()
-            if key not in {"n_clusters", "g", "cluster_search"}
+            if key not in ({"g", "m"} if model["name"] in ROBUST_MODELS else {"n_clusters", "cluster_search"})
         },
         "constraints": model.get("constraints", "not_applicable"),
         "n_clusters": n_clusters,
     }
+    if model["name"] in ROBUST_MODELS:
+        settings["candidate_schema"] = "robust_pairs_v1"
     return _fingerprint(settings)
 
 
@@ -181,14 +188,14 @@ def cluster_search_fingerprint(config: LoadedConfig) -> str:
     return _fingerprint(
         {
             "model": stage_fingerprint(config, "train_model"),
-            "candidates": search["candidates"],
+            "candidates": search_candidates(config),
         }
     )
 
 
 def selection_fingerprint(config: LoadedConfig) -> str:
     search = config.model_config.get("cluster_search")
-    if not search or not search.get("enabled"):
+    if not uses_candidate_artifacts(config):
         raise ValueError("Cluster selection artifacts require enabled cluster search")
     return _fingerprint(
         {

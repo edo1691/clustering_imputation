@@ -3,8 +3,8 @@
 from typing import Any, Dict
 
 from .base import ClusterModel
+from ..robust_support import normalize_robust_config
 from .kmeans import KMeansModel
-from .robust_coclustering import RobustCoclustering
 from .constrained_kmeans import ConstrainedKMeans
 from .constrained_coclustering import ConstrainedCoclustering
 from .robust_constrained_coclustering import RobustConstrainedCoclustering
@@ -25,8 +25,13 @@ def create_model(model_config: Dict[str, Any]) -> ClusterModel:
     name = model_config["name"]
     if name == "kmeans":
         return KMeansModel(model_config["parameters"])
-    if name == "robust_coclustering":
-        return RobustCoclustering(model_config["parameters"])
+    if name in {"robust_coclustering", "robust_constrained_coclustering"}:
+        normalized = normalize_robust_config(model_config)
+        model = RobustConstrainedCoclustering(normalized["parameters"])
+        model.registration_name = name
+        if "source_configuration" in normalized:
+            model.integration_config_ = normalized["source_configuration"]
+        return model
     if name == "constrained_kmeans":
         return ConstrainedKMeans(
             model_config["parameters"], model_config["constraints"]
@@ -37,21 +42,22 @@ def create_model(model_config: Dict[str, Any]) -> ClusterModel:
         return ConstrainedCoclustering(
             model_config["parameters"], model_config["constraints"]
         )
-    if name == "robust_constrained_coclustering":
-        settings = {
-            "constraints": model_config["constraints"],
-            "trimming": model_config["trimming"],
-        }
-        return RobustConstrainedCoclustering(model_config["parameters"], settings)
     raise ValueError("No model registered as {!r}".format(name))
 
 
 def training_constraints(model_config: Dict[str, Any]) -> Dict[str, Any]:
     """Translate supported row-size bounds to the pipeline check schema."""
-    if model_config["name"] == "robust_coclustering":
-        parameters = model_config["parameters"]
+    if model_config["name"] in {"robust_coclustering", "robust_constrained_coclustering"}:
+        parameters = algorithm_parameters(model_config)
         return {
             "min_cluster_size": 1 if parameters.get("row_size_min") is None else parameters["row_size_min"],
             "max_cluster_size": parameters.get("row_size_max"),
         }
     return model_config.get("constraints", {})
+
+
+def algorithm_parameters(model_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Map the legacy template configuration to equivalent algorithm arguments."""
+    if model_config["name"] in {"robust_coclustering", "robust_constrained_coclustering"}:
+        return normalize_robust_config(model_config)["parameters"]
+    return dict(model_config["parameters"])

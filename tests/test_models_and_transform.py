@@ -85,25 +85,22 @@ def test_spectral_coclustering_rejects_unsupported_input():
         model.fit(np.ones((10, 3)))
 
 
-def test_future_coclustering_is_registered_but_explicitly_unimplemented():
-    model = create_model(
-        {
-            "name": "robust_constrained_coclustering",
-            "parameters": {
-                "n_row_clusters": 2,
-                "n_column_clusters": 2,
-                "random_state": 1,
-                "max_iter": 10,
-                "n_init": 1,
-            },
-            "constraints": {"min_row_cluster_size": 2},
-            "trimming": {"row_fraction": 0.1, "column_fraction": 0.1},
-        }
-    )
-    with pytest.raises(NotImplementedError, match="template only"):
-        model.fit(np.ones((10, 4)))
-    with pytest.raises(NotImplementedError, match="prediction is not implemented"):
-        model.predict(np.ones((2, 4)))
+def test_legacy_robust_rejects_unsupported_row_column_trimming():
+    with pytest.raises(ValueError, match="cell-trimming"):
+        create_model(
+            {
+                "name": "robust_constrained_coclustering",
+                "parameters": {
+                    "n_row_clusters": 2,
+                    "n_column_clusters": 2,
+                    "random_state": 1,
+                    "max_iter": 10,
+                    "n_init": 1,
+                },
+                "constraints": {"min_row_cluster_size": 2},
+                "trimming": {"row_fraction": 0.1, "column_fraction": 0.1},
+            }
+        )
 
 
 def test_constrained_coclustering_is_registered_and_unimplemented():

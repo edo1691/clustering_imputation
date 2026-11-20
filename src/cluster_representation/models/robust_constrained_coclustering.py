@@ -5,7 +5,7 @@ from typing import Any, Dict, Mapping
 import numpy as np
 
 from .base import ClusterModel
-from . import robcoclust_constrained as algorithm
+from .custom import robcoclust_constrained as algorithm
 
 
 class RobustConstrainedCoclustering(ClusterModel):
@@ -83,7 +83,8 @@ class RobustConstrainedCoclustering(ClusterModel):
             raise RuntimeError("Model has not been fitted")
         result = self.result_
         return {
-            "name": "robust_coclustering",
+            "name": getattr(self, "registration_name", "robust_coclustering"),
+            "integration_config": getattr(self, "integration_config_", None),
             "parameters": self.parameters,
             "n_clusters": int(len(np.unique(self.labels_))),
             "n_column_clusters": int(len(np.unique(self.column_labels_))),

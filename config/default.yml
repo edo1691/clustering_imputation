@@ -1,5 +1,5 @@
 dataset:
-  n_rows: 100000
+  n_rows: 10000
   seed: 12345
   id_column: id_row
 
@@ -52,7 +52,7 @@ preprocessing:
 models:
   run:
     - constrained_kmeans
-    - spectral_coclustering
+    - robust_constrained_coclustering
 
 prototypes:
   aggregation: median
