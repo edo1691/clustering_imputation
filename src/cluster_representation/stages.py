@@ -615,6 +615,8 @@ def _train_cluster_search(
         "train_model",
         candidate_artifacts,
         {
+            "model": model_name,
+            "fixed_m": config.model_config["parameters"].get("m"),
             "training_rows": n_train,
             "candidate_count": len(search["candidates"]),
             "selection_mode": selection["selection_mode"],
