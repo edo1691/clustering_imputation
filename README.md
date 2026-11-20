@@ -347,3 +347,98 @@ Windows PowerShell:
 ```
 
 Tests cover configuration validation, reproducibility, exact scenario counts, split integrity, training-only preprocessing, constrained fitting, serialization, prototype construction, feature replacement, artifact compatibility, model-template errors, and a small end-to-end pipeline.
+
+## Robust Gaussian co-clustering
+
+Add `robust_coclustering` to `models.run` in the central configuration. The
+loader automatically reads `config/models/robust_coclustering.yml`. For example:
+
+```yaml
+models:
+  run:
+    - constrained_kmeans
+    - kmeans
+    - spectral_coclustering
+    - robust_coclustering
+```
+
+Run through the normal CLI, `python -m cluster_representation --config
+config/default.yml`, after editing the model list. `kmeans` is the unconstrained
+scikit-learn baseline and uses `config/models/kmeans.yml`.
+
+`models/robust_coclustering.py` is a thin adapter around the original
+`models/robcoclust_constrained.py:tbcem_constrained`. The original algorithm source
+is preserved byte-for-byte. The pipeline passes the shared training-fitted median
+imputation and optional standard scaling output as a two-dimensional matrix.
+The implementation treats each customer-feature cell as univariate (`d=1`). It
+accepts signed values, so no nonnegative transform or feature removal is used.
+The common clustering metrics use that same shared feature space. The core
+algorithm also supports three-way arrays and missing cells; the pipeline uses
+its existing two-dimensional, median-imputed representation.
+
+The adapter passes the actual algorithm parameters through with their original
+names and defaults. `g` counts row/customer clusters and `m` counts column/feature
+clusters. With cluster search enabled, omit `g`: each candidate supplies `g`,
+while `m` and every other parameter remain fixed. Automatic selection uses the
+existing average ranks of silhouette, Davies--Bouldin and Calinski--Harabasz,
+with smaller `g` breaking ties. For fixed fitting, remove `cluster_search` and
+set `g` in `parameters`, or disable search and set a matching integer
+`selected_n_clusters`. Search candidates must be at least two for metric-based
+selection; direct fixed fitting also permits `g=1`, whose clustering metrics
+are unavailable.
+
+Parameters exposed in the robust model YAML:
+
+| Parameter | Meaning |
+|---|---|
+| `g`, `m` | Separate row and column cluster counts |
+| `row_size_min`, `row_size_max` | Training row-group size bounds; null defaults to 1 and training row count |
+| `col_size_min`, `col_size_max` | Training column-group size bounds; null defaults to 1 and feature count |
+| `trim_lvl` | Fraction of observed cells trimmed, default 0.10 |
+| `c` | Global covariance eigenvalue-ratio bound, null disables it |
+| `consistency` | Trimmed covariance consistency correction, default true |
+| `n_init` | Requested random initialisations, default 10 |
+| `until_converged` | Continue initialisations until a non-degenerate run, subject to the cap |
+| `iter_max`, `tol` | Iteration cap and relative objective tolerance |
+| `max_init` | Total initialisation cap; null uses ten times `n_init` |
+| `max_init_attempts` | Random partition attempts per initialisation, default 50 |
+| `init_max_cells` | Robust initial-estimation subsample per block, default 500; null uses all cells |
+| `seed` | NumPy generator seed; null permits nondeterminism |
+| `verbose` | Algorithm progress-print frequency or false |
+
+Row and column size bounds are enforced by the original min-cost-flow solver.
+Row minimum/maximum bounds feed pipeline violation checks. Column counts and
+bounds are recorded in model metadata. Infeasible candidate fits and unavailable
+metrics retain the existing failure/status schema. The algorithm retains its
+own degeneracy fallback and warnings. Random partitions and subsampling use
+`seed`; multivariate MCD initialization in the original source fixes its own
+`random_state=0`. Dependencies include SciPy, scikit-learn, NumPy and OR-Tools,
+now declared explicitly where needed.
+
+The user-approved out-of-sample method exists only in the adapter. It keeps
+training `w`, `mu`, `sigma` and `pi` fixed, initializes each row by maximum
+posterior, then alternates the original Mahalanobis trimming and Gaussian row
+posterior helpers until labels and mask stabilize. No model fitting or parameter
+updates occur on test rows. Failure to stabilize within `iter_max` raises an
+explicit error. No training size bounds apply to prediction batches. Trimming
+uses the whole prediction batch, so batch composition can affect assignments.
+An entirely masked row follows the fitted row proportions; ties use the lowest
+cluster index. Pipeline input validation and train-fitted imputation handle
+missing values before assignment.
+
+Training one-hot memberships are validated before converting their indices to
+one-based pipeline labels. Original `z`, `w`, `mu`, `sigma`, `pi`, `rho`, `mask`,
+score, convergence summaries and all per-initialisation `evolution` histories
+remain in `model.result_` in the joblib artifact. These histories can be large.
+Reload through the existing `ClusterModel.load` or storage workflow. Training
+IDs and feature order remain in stage metadata; column label Parquet artifacts
+also contain feature names and indices. Separate model representation metadata
+is saved beside each fitted model.
+
+Column clustering affects the Gaussian model and prediction. Downstream
+replacement uses the existing training-derived per-row-cluster feature medians,
+independently of Gaussian block means. All configured NC scenarios reuse the
+shared data split and indicators. Structured metrics, cluster-selection,
+overall and feature tables, and their journal LaTeX exports include the model.
+The overall table retains `N MAE` and omits raw MAE; raw MAE remains in structured
+and feature results.

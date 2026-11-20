@@ -4,6 +4,8 @@ import json
 import math
 from typing import Any, Dict, List, Mapping, Optional
 
+from .models.registry import training_constraints
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
@@ -37,6 +39,8 @@ def resolve_cluster_selection(
         requested_k = int(candidate["n_clusters"])
         parameters = _selection_mapping(candidate.get("model_parameters"))
         parameters.pop("n_clusters", None)
+        if method == "robust_coclustering":
+            parameters.pop("g", None)
         candidate_constraints = _selection_mapping(candidate.get("constraints"))
         if not candidate_constraints and constraints_applicable:
             candidate_constraints = dict(constraints)
@@ -55,7 +59,7 @@ def resolve_cluster_selection(
         candidate_result = {
             "requested_n_clusters": requested_k,
             "actual_clusters": (
-                int(candidate.get("n_clusters"))
+                int(candidate.get("actual_clusters", candidate["n_clusters"]))
                 if candidate.get("status") == "success"
                 else None
             ),
@@ -400,14 +404,13 @@ def evaluate(
             "This transformation alone does not establish anonymity or regulatory compliance.",
         ],
     }
-    required_minimum = config.model_config.get("constraints", {}).get(
-        "min_cluster_size"
-    )
+    required_minimum = training_constraints(config.model_config).get("min_cluster_size")
+    required_maximum = training_constraints(config.model_config).get("max_cluster_size")
     if required_minimum is not None:
         result["constraint_violations"] = [
             {"cluster": int(cluster), "size": int(size)}
             for cluster, size in train_sizes.items()
-            if size < required_minimum
+            if size < required_minimum or (required_maximum is not None and size > required_maximum)
         ]
     id_column = config["dataset"]["id_column"]
     feature_names = [feature["name"] for feature in config["features"]]

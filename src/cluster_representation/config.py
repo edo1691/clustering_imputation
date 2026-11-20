@@ -212,7 +212,70 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
         raise ConfigurationError("Cannot read model config {}: {}".format(path, exc))
     _mapping(model, "model configuration")
     name = model.get("name")
-    if name == "spectral_coclustering":
+    if name == "robust_coclustering":
+        _keys(model, {"name", "parameters", "cluster_search"}, "model configuration")
+        _require(model, {"name", "parameters"}, "model configuration")
+        parameters = _mapping(model["parameters"], "model.parameters")
+        allowed = {
+            "g", "m", "row_size_min", "row_size_max", "col_size_min", "col_size_max",
+            "trim_lvl", "c", "consistency", "n_init", "until_converged", "iter_max",
+            "tol", "max_init", "max_init_attempts", "init_max_cells", "seed", "verbose",
+        }
+        _keys(parameters, allowed, "model.parameters")
+        _require(parameters, {"m"}, "model.parameters")
+        for key in ("g", "m", "n_init", "iter_max", "max_init_attempts"):
+            if key in parameters:
+                _integer(parameters[key], "model.parameters." + key, 1)
+        for key in ("max_init", "init_max_cells"):
+            if parameters.get(key) is not None:
+                _integer(parameters[key], "model.parameters." + key, 1)
+        for key in ("row_size_min", "row_size_max", "col_size_min", "col_size_max", "seed"):
+            if parameters.get(key) is not None:
+                _integer(parameters[key], "model.parameters." + key, 0)
+        for key in ("consistency", "until_converged"):
+            if key in parameters and not isinstance(parameters[key], bool):
+                raise ConfigurationError("model.parameters." + key + " must be boolean")
+        if "verbose" in parameters and not isinstance(parameters["verbose"], bool):
+            _integer(parameters["verbose"], "model.parameters.verbose", 0)
+        trim = _number(parameters.get("trim_lvl", 0.10), "model.parameters.trim_lvl", 0)
+        if trim >= 1:
+            raise ConfigurationError("model.parameters.trim_lvl must be below 1")
+        for key, minimum in (("c", 1), ("tol", 0)):
+            if parameters.get(key) is not None:
+                _number(parameters[key], "model.parameters." + key, minimum)
+        search = model.get("cluster_search")
+        if search is None:
+            _require(parameters, {"g"}, "model.parameters")
+        else:
+            _mapping(search, "model.cluster_search")
+            _keys(search, {"enabled", "candidates", "selected_n_clusters"}, "model.cluster_search")
+            _require(search, {"enabled", "candidates", "selected_n_clusters"}, "model.cluster_search")
+            if not isinstance(search["enabled"], bool):
+                raise ConfigurationError("model.cluster_search.enabled must be boolean")
+            candidates = search["candidates"]
+            if not isinstance(candidates, list) or not candidates:
+                raise ConfigurationError("model.cluster_search.candidates must be non-empty")
+            for candidate in candidates:
+                _integer(candidate, "model.cluster_search.candidate", 2)
+            if len(set(candidates)) != len(candidates):
+                raise ConfigurationError("model.cluster_search.candidates must be unique")
+            selected = search["selected_n_clusters"]
+            if selected == "auto":
+                if not search["enabled"]:
+                    raise ConfigurationError("Automatic selection requires enabled cluster search")
+            else:
+                _integer(selected, "model.cluster_search.selected_n_clusters", 2)
+                if selected not in candidates:
+                    raise ConfigurationError("Selected cluster count must be a candidate")
+            if search["enabled"]:
+                if "g" in parameters:
+                    raise ConfigurationError("Omit g when cluster search is enabled; candidates vary g")
+            else:
+                if "g" in parameters and parameters["g"] != selected:
+                    raise ConfigurationError("g must match selected_n_clusters")
+                parameters["g"] = selected
+        return model
+    if name in {"spectral_coclustering", "kmeans"}:
         _keys(
             model,
             {"name", "parameters", "cluster_search"},
@@ -220,7 +283,9 @@ def _validate_model_config(path: Path) -> Dict[str, Any]:
         )
         _require(model, {"name", "parameters", "cluster_search"}, "model configuration")
         parameters = _mapping(model["parameters"], "model.parameters")
-        _keys(parameters, {"n_clusters", "random_state", "n_init"}, "model.parameters")
+        _keys(parameters, {"n_clusters", "random_state", "n_init"} | ({"max_iter"} if name == "kmeans" else set()), "model.parameters")
+        if "max_iter" in parameters:
+            _integer(parameters["max_iter"], "model.parameters.max_iter", 1)
         _require(parameters, {"random_state", "n_init"}, "model.parameters")
         _integer(parameters["random_state"], "model.parameters.random_state", 0)
         _integer(parameters["n_init"], "model.parameters.n_init", 1)

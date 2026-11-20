@@ -13,6 +13,7 @@ from . import generation, nonconsent, preprocessing, prototypes, reporting, spli
 from . import storage, transformation
 from .config import LoadedConfig
 from .models import create_model
+from .models.registry import training_constraints
 from .randomness import generator
 from .validation import validate_stage_artifacts
 
@@ -236,7 +237,7 @@ def train_model(config: LoadedConfig) -> StageResult:
     metadata_path = "models/metadata.json"
     artifacts = {"model": model_path, "metadata": metadata_path}
     training_artifacts = [model_path, metadata_path]
-    if config.model_config["name"] == "spectral_coclustering":
+    if config.model_config["name"] in {"spectral_coclustering", "robust_coclustering"}:
         preprocessing_path = "models/model_preprocessor.joblib"
         column_labels_path = "models/column_labels.parquet"
         storage.write_object(config, preprocessing_path, model.preprocessing_)
@@ -301,11 +302,13 @@ def _train_cluster_search(
 ) -> StageResult:
     search = config.model_config["cluster_search"]
     model_name = config.model_config["name"]
-    constraints_applicable = model_name == "constrained_kmeans"
-    constraints = config.model_config.get("constraints", {})
+    constraints_applicable = model_name in {"constrained_kmeans", "robust_coclustering"}
+    constraints = training_constraints(config.model_config)
     n_train = len(train_features)
     id_column = config["dataset"]["id_column"]
-    seed = config.model_config["parameters"]["random_state"]
+    seed = config.model_config["parameters"].get("seed", config.model_config["parameters"].get("random_state"))
+    if seed is None:
+        seed = config["dataset"]["seed"]
     sample_size = min(n_train, config["evaluation"]["silhouette_sample_size"])
     sample_rng = generator(seed, "cluster-search:silhouette")
     silhouette_indices = np.sort(
@@ -314,7 +317,7 @@ def _train_cluster_search(
     rows = []
     candidate_artifacts: Dict[str, str] = {}
     minimum_size = (
-        config.model_config["constraints"]["min_cluster_size"]
+        training_constraints(config.model_config)["min_cluster_size"]
         if constraints_applicable
         else None
     )
@@ -326,7 +329,7 @@ def _train_cluster_search(
             "assignments": base + "/train_cluster_assignments.parquet",
             "metadata": base + "/metadata.json",
         }
-        if model_name == "spectral_coclustering":
+        if model_name in {"spectral_coclustering", "robust_coclustering"}:
             paths["column_labels"] = base + "/column_labels.parquet"
             paths["model_preprocessor"] = base + "/model_preprocessor.joblib"
         stage_key = storage.candidate_stage_key(
@@ -370,9 +373,9 @@ def _train_cluster_search(
                     "name": model_name,
                     "parameters": dict(config.model_config["parameters"]),
                 }
-                if constraints_applicable:
+                if model_name == "constrained_kmeans":
                     candidate_model_config["constraints"] = constraints
-                candidate_model_config["parameters"]["n_clusters"] = candidate
+                candidate_model_config["parameters"]["g" if model_name == "robust_coclustering" else "n_clusters"] = candidate
                 model = create_model(candidate_model_config)
                 started = time.perf_counter()
                 try:
@@ -409,7 +412,7 @@ def _train_cluster_search(
                             )
                         )
                     violations = (
-                        np.flatnonzero(counts < minimum_size) + 1
+                        np.flatnonzero((counts < minimum_size) | (counts > (constraints.get("max_cluster_size") or n_train))) + 1
                         if constraints_applicable
                         else np.array([], dtype=int)
                     )
@@ -422,6 +425,8 @@ def _train_cluster_search(
                         status="success",
                         failure_reason=None,
                         training_time_seconds=training_seconds,
+                        actual_clusters=int(len(np.unique(labels))),
+                        model_metadata=json.dumps(model_metadata, sort_keys=True),
                         constraint_violations=int(len(violations)),
                         constraint_violation_clusters=violations.tolist(),
                         constraint_applicability=(
@@ -460,7 +465,7 @@ def _train_cluster_search(
                     storage.write_object(config, paths["model"], model)
                     storage.write_frame(config, paths["assignments"], assignments)
                     storage.write_json(config, paths["metadata"], candidate_result)
-                    if model_name == "spectral_coclustering":
+                    if model_name in {"spectral_coclustering", "robust_coclustering"}:
                         feature_names = [
                             feature["name"] for feature in config["features"]
                         ]
@@ -546,7 +551,7 @@ def _train_cluster_search(
         for candidate in comparison.to_dict(orient="records"):
             candidate = dict(candidate)
             parameters = dict(config.model_config["parameters"])
-            parameters["n_clusters"] = int(candidate["n_clusters"])
+            parameters["g" if model_name == "robust_coclustering" else "n_clusters"] = int(candidate["n_clusters"])
             if not candidate.get("model_parameters"):
                 candidate["model_parameters"] = json.dumps(
                     parameters, sort_keys=True
@@ -675,7 +680,7 @@ def _require_selected_candidate(config: LoadedConfig, n_clusters: int) -> tuple:
         n_clusters, model_name
     )
     required = [model_path, assignments_path, metadata_path]
-    if model_name == "spectral_coclustering":
+    if model_name in {"spectral_coclustering", "robust_coclustering"}:
         required.extend(
             [
                 "models/{}/k_{}/column_labels.parquet".format(model_name, n_clusters),
@@ -731,7 +736,7 @@ def build_prototypes(config: LoadedConfig) -> StageResult:
         train[config["dataset"]["id_column"]]
     ):
         raise ValueError("Saved model was fitted on different training IDs")
-    minimum = config.model_config.get("constraints", {}).get("min_cluster_size", 1)
+    minimum = training_constraints(config.model_config).get("min_cluster_size", 1)
     built = prototypes.build_prototypes(train, model.labels_, config, minimum)
     assignment_path = "prototypes/train_cluster_assignments.parquet"
     prototype_path = "prototypes/cluster_prototypes.parquet"
@@ -778,8 +783,8 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
     comparison = storage.read_frame(config, comparison_path)
     model_name = config.model_config["name"]
     minimum_size = (
-        config.model_config["constraints"]["min_cluster_size"]
-        if model_name == "constrained_kmeans"
+        training_constraints(config.model_config)["min_cluster_size"]
+        if model_name in {"constrained_kmeans", "robust_coclustering"}
         else 1
     )
     artifacts: Dict[str, str] = {"comparison": comparison_path}
@@ -796,7 +801,7 @@ def _build_cluster_search_prototypes(config: LoadedConfig) -> StageResult:
             "train_model", candidate, model_name
         )
         candidate_required = [model_path, assignment_path, metadata_path]
-        if model_name == "spectral_coclustering":
+        if model_name in {"spectral_coclustering", "robust_coclustering"}:
             candidate_required.extend(
                 [
                     "models/{}/k_{}/column_labels.parquet".format(
@@ -1264,13 +1269,13 @@ def evaluate(config: LoadedConfig) -> StageResult:
         transform_result.artifacts["test_assignments"],
         *transformed_artifacts,
     ]
-    if model_name == "spectral_coclustering":
+    if model_name in {"spectral_coclustering", "robust_coclustering"}:
         if selected_k is None:
             artifact_paths.extend(
                 ["models/model_preprocessor.joblib", "models/column_labels.parquet"]
             )
         else:
-            base = "models/spectral_coclustering/k_{}".format(selected_k)
+            base = "models/{}/k_{}".format(model_name, selected_k)
             artifact_paths.extend(
                 [
                     base + "/model_preprocessor.joblib",
@@ -1304,6 +1309,8 @@ def evaluate(config: LoadedConfig) -> StageResult:
         "constraint_applicability",
         "applicable" if model_name == "constrained_kmeans" else "not applicable",
     )
+    if model_name == "robust_coclustering":
+        report["model_metadata"] = saved_model_metadata
     report["assignment_strategy"] = saved_model_metadata.get(
         "assignment_strategy", "model.predict"
     )

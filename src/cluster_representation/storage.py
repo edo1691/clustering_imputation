@@ -50,7 +50,7 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
         model_settings = config.model_config
         if (
             model_settings["name"]
-            in {"constrained_kmeans", "spectral_coclustering"}
+            in {"constrained_kmeans", "spectral_coclustering", "robust_coclustering", "kmeans"}
             and model_settings.get("cluster_search", {}).get("enabled", False)
         ):
             model_settings = {
@@ -58,7 +58,7 @@ def stage_fingerprint(config: LoadedConfig, stage: str) -> str:
                 "parameters": {
                     key: value
                     for key, value in model_settings["parameters"].items()
-                    if key != "n_clusters"
+                    if key not in {"n_clusters", "g"}
                 },
             }
             if "constraints" in config.model_config:
@@ -104,7 +104,7 @@ def selected_candidate(config: LoadedConfig) -> Optional[int]:
     search = config.model_config.get("cluster_search")
     if (
         config.model_config["name"]
-        in {"constrained_kmeans", "spectral_coclustering"}
+        in {"constrained_kmeans", "spectral_coclustering", "robust_coclustering", "kmeans"}
         and search
         and search["enabled"]
     ):
@@ -151,7 +151,7 @@ def candidate_training_fingerprint(config: LoadedConfig, n_clusters: int) -> str
         "parameters": {
             key: value
             for key, value in model["parameters"].items()
-            if key not in {"n_clusters", "cluster_search"}
+            if key not in {"n_clusters", "g", "cluster_search"}
         },
         "constraints": model.get("constraints", "not_applicable"),
         "n_clusters": n_clusters,

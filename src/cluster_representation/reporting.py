@@ -10,6 +10,7 @@ import pandas as pd
 
 from . import nonconsent, storage, transformation
 from .config import LoadedConfig
+from .models.registry import training_constraints
 
 
 _COMBINED_COLUMNS = [
@@ -596,7 +597,7 @@ def _read_cluster_selection(config: LoadedConfig) -> Dict[str, Any]:
         )
         return storage.read_json(config, path)
 
-    configured_k = int(config.model_config["parameters"]["n_clusters"])
+    configured_k = int(config.model_config["parameters"]["g" if config.model_config["name"] == "robust_coclustering" else "n_clusters"])
     return {
         "selection_mode": "fixed",
         "configured_selected_n_clusters": configured_k,
@@ -605,7 +606,7 @@ def _read_cluster_selection(config: LoadedConfig) -> Dict[str, Any]:
         "excluded_candidates": [],
         "constraint_applicability": (
             "applicable"
-            if config.model_config["name"] == "constrained_kmeans"
+            if config.model_config["name"] in {"constrained_kmeans", "robust_coclustering"}
             else "not applicable"
         ),
     }
@@ -667,7 +668,7 @@ def _cluster_selection_records(
                         "k={}".format(requested_k)
                     )
                 parameters = _metadata_mapping(metadata.get("model_parameters"))
-                if int(parameters.get("n_clusters", -1)) != requested_k:
+                if int(parameters.get("g" if model_name == "robust_coclustering" else "n_clusters", -1)) != requested_k:
                     raise ValueError(
                         "Candidate comparison requested k does not match saved model "
                         "metadata for k={}".format(requested_k)
@@ -682,7 +683,7 @@ def _cluster_selection_records(
     metadata = storage.read_json(config, "models/metadata.json")
     parameters = metadata.get("parameters", {})
     constraints = metadata.get("constraints", {})
-    requested_k = parameters.get("n_clusters")
+    requested_k = parameters.get("g" if model_name == "robust_coclustering" else "n_clusters")
     if requested_k is None:
         raise ValueError("Saved model metadata is missing requested n_clusters")
     return [
@@ -741,7 +742,7 @@ def _cluster_selection_record(
         actual_clusters = evaluation_metrics.get("n_clusters")
     configuration = {
         "parameters": {
-            key: value for key, value in parameters.items() if key != "n_clusters"
+            key: value for key, value in parameters.items() if key not in {"n_clusters", "g"}
         },
         "constraints": dict(constraints),
     }
@@ -905,9 +906,9 @@ def _cluster_search_evaluation_rows(config: LoadedConfig) -> List[Dict[str, Any]
     feature_names = [feature["name"] for feature in config["features"]]
     id_column = config["dataset"]["id_column"]
     model_name = config.model_config["name"]
-    constraints_applicable = model_name == "constrained_kmeans"
+    constraints_applicable = model_name in {"constrained_kmeans", "robust_coclustering"}
     minimum_size = (
-        config.model_config["constraints"]["min_cluster_size"]
+        training_constraints(config.model_config)["min_cluster_size"]
         if constraints_applicable
         else None
     )

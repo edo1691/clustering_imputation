@@ -1,0 +1,23 @@
+name: robust_coclustering
+parameters:
+  m: 2
+  seed: 12345
+  row_size_min: 1
+  row_size_max: null
+  col_size_min: 1
+  col_size_max: null
+  trim_lvl: 0.10
+  c: null
+  consistency: true
+  n_init: 10
+  until_converged: true
+  iter_max: 50
+  tol: 1.0e-10
+  max_init: null
+  max_init_attempts: 50
+  init_max_cells: 500
+  verbose: false
+cluster_search:
+  enabled: true
+  candidates: [2, 3, 4]
+  selected_n_clusters: auto
