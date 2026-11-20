@@ -409,19 +409,19 @@ def test_cluster_selection_report_uses_saved_candidate_metadata_and_ranks_metric
             "models/constrained_kmeans/k_{}/metadata.json".format(requested_k),
         )
         row = by_k[requested_k]
-        assert row[2] == str(metadata["n_clusters"])
-        assert row[8] == str(metadata["training_time_seconds"])
-        assert row[7] == (
+        assert row[3] == str(metadata["n_clusters"])
+        assert row[10] == str(metadata["training_time_seconds"])
+        assert row[9] == (
             "Yes"
             if requested_k
             == small_search_config.model_config["cluster_search"]["selected_n_clusters"]
             else "No"
         )
         for index, value_key, status_key, maximize in (
-            (3, "silhouette_score", "silhouette_status", True),
-            (4, "davies_bouldin_index", "davies_bouldin_status", False),
+            (5, "silhouette_score", "silhouette_status", True),
+            (6, "davies_bouldin_index", "davies_bouldin_status", False),
             (
-                5,
+                7,
                 "calinski_harabasz_index",
                 "calinski_harabasz_status",
                 True,
@@ -688,8 +688,8 @@ def test_auto_selection_routes_all_downstream_artifacts_through_resolved_model(
         if line.startswith("| constrained_kmeans")
     ]
     assert len(report_rows) == 3
-    assert next(row for row in report_rows if int(row[1]) == selected_k)[7] == "Yes"
-    assert next(row for row in report_rows if row[1] == "20")[6] == "—"
+    assert next(row for row in report_rows if int(row[1]) == selected_k)[9] == "Yes"
+    assert next(row for row in report_rows if row[1] == "20")[8] == "—"
     assert "Automatic selection averages" in report
 
 
@@ -811,7 +811,7 @@ def test_spectral_coclustering_runs_fixed_and_auto_pipeline_without_retraining(
         if line.startswith("| spectral_coclustering")
     ]
     assert len(report_rows) == 2
-    assert next(row for row in report_rows if int(row[1]) == selected)[7] == "Yes"
+    assert next(row for row in report_rows if int(row[1]) == selected)[9] == "Yes"
     assert "Constraint applicability: not applicable." in report
     overall = (root / "tables/overall_comparison.md").read_text(encoding="utf-8")
     assert len(

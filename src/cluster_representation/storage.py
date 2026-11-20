@@ -197,12 +197,13 @@ def selection_fingerprint(config: LoadedConfig) -> str:
     search = config.model_config.get("cluster_search")
     if not uses_candidate_artifacts(config):
         raise ValueError("Cluster selection artifacts require enabled cluster search")
-    return _fingerprint(
-        {
-            "cluster_search": cluster_search_fingerprint(config),
-            "configured_selected_n_clusters": search["selected_n_clusters"],
-        }
-    )
+    settings = {
+        "cluster_search": cluster_search_fingerprint(config),
+        "configured_selected_n_clusters": search["selected_n_clusters"],
+    }
+    if config.model_config["name"] in ROBUST_MODELS:
+        settings["selection_schema_version"] = 2
+    return _fingerprint(settings)
 
 
 def selection_stage_key(config: LoadedConfig) -> str:

@@ -368,7 +368,7 @@ def export_multi_model_comparisons(
     if cluster_selection_reports:
         content = _merge_model_markdown_tables(
             cluster_selection_reports,
-            "| Method | Requested k |",
+            "| Method | Requested g |",
             "### Cluster selection comparison",
         )
         _write_report_with_journal(
@@ -515,35 +515,41 @@ def export_cluster_selection_comparison(
             record["method"],
             record["configuration_key"],
             record["requested_k"],
+            record.get("requested_m") or 0,
         )
     )
 
     rows = []
     for record in records:
+        selected = record["requested_k"] == selection["selected_n_clusters"]
+        if selection.get("selected_pair"):
+            selected = selected and record.get("requested_m") == selection["selected_pair"]["m"]
+        status = record.get("status", "success")
+        reasons = record.get("exclusion_reasons", [])
+        if reasons:
+            status += "; excluded: " + "; ".join(reasons)
+        status = status.replace("\n", " ").replace("|", "\\|")
         values = [
             record["display_method"],
             str(record["requested_k"]),
+            _markdown_number(record.get("requested_m")),
             _markdown_number(record["actual_clusters"]),
+            _markdown_number(record.get("actual_m")),
             _format_ranked_metric(record, "silhouette"),
             _format_ranked_metric(record, "davies_bouldin"),
             _format_ranked_metric(record, "calinski_harabasz"),
-            (
-                _markdown_number(record.get("selection_score"))
-                if selection["selection_mode"] == "auto"
-                else "—"
-            ),
-            "Yes" if record["requested_k"] == selection["selected_n_clusters"] and (not selection.get("selected_pair") or record.get("requested_m") == selection["selected_pair"]["m"]) else "No",
+            _markdown_number(record.get("selection_score")) if selection["selection_mode"] == "auto" else "—",
+            "Yes" if selected else "No",
             _markdown_number(record["training_time_seconds"]),
-            _markdown_number(record.get("requested_m")),
-            _markdown_number(record.get("actual_m")),
+            status,
         ]
         rows.append("| {} |".format(" | ".join(values)))
     content = "\n".join(
         [
             "### Cluster selection comparison",
             "",
-            "| Method | Requested k | Actual clusters | Silhouette ↑ | Davies–Bouldin ↓ | Calinski–Harabasz ↑ | Selection score ↓ | Selected | Training time (s) | Requested m | Actual feature clusters |",
-            "|--------|-------------|-----------------|--------------|-----------------|--------------------|-------------------|----------|------------------|-------------|-------------------------|",
+            "| Method | Requested g | Requested m | Actual row clusters | Actual column clusters | Silhouette ↑ | Davies–Bouldin ↓ | Calinski–Harabasz ↑ | Selection score ↓ | Selected | Training time (s) | Status |",
+            "|--------|-------------|-------------|---------------------|------------------------|--------------|-----------------|--------------------|-------------------|----------|-------------------|--------|",
             *rows,
             "",
             "Bold values identify the best result for each metric within each method and equivalent configuration group.",
@@ -560,7 +566,7 @@ def export_cluster_selection_comparison(
                 selection["configured_selected_n_clusters"],
                 selection["selected_n_clusters"],
             ),
-            "Selected pair: {}. Requested k denotes customer groups; m denotes feature groups. Pair ties use smaller g, then smaller m. Metrics evaluate customer partitions.".format(selection.get("selected_pair")),
+            "Selected pair: {}. Requested g denotes customer groups; m denotes feature groups. Pair ties use smaller g, then smaller m. Metrics evaluate customer partitions.".format(selection.get("selected_pair")),
             "Constraint applicability: {}.".format(
                 selection.get("constraint_applicability", "applicable")
             ),

@@ -5,7 +5,7 @@ import math
 from typing import Any, Dict, List, Mapping, Optional
 
 from .models.registry import training_constraints
-from .robust_support import ROBUST_MODELS
+from .robust_support import ROBUST_MODELS, ClusterPair
 
 import numpy as np
 import pandas as pd
@@ -58,16 +58,39 @@ def resolve_cluster_selection(
         reasons = _selection_exclusion_reasons(
             candidate, constraints, constraints_applicable
         )
+        model_metadata = _selection_mapping(candidate.get("model_metadata"))
+        violation_clusters = candidate.get("constraint_violation_clusters")
+        if not isinstance(violation_clusters, (list, tuple, np.ndarray)):
+            violation_clusters = []
+        raw_violation_count = candidate.get("constraint_violations")
+        try:
+            violation_count = int(raw_violation_count) if math.isfinite(float(raw_violation_count)) else None
+        except (TypeError, ValueError):
+            violation_count = None
+        actual_rows = None
+        if candidate.get("status") == "success":
+            try:
+                actual_rows = int(candidate.get("actual_clusters", requested_k))
+            except (TypeError, ValueError, OverflowError):
+                actual_rows = requested_k
         candidate_result = {
+            "candidate_id": str(ClusterPair(requested_k, int(candidate["requested_column_clusters"]))) if method in ROBUST_MODELS else str(requested_k),
+            "row_cluster_sizes": model_metadata.get("training_cluster_sizes", {}),
+            "column_cluster_sizes": model_metadata.get("column_cluster_sizes", {}),
+            "metric_statuses": {
+                "silhouette": candidate.get("silhouette_status"),
+                "davies_bouldin": candidate.get("davies_bouldin_status"),
+                "calinski_harabasz": candidate.get("calinski_harabasz_status"),
+            },
+            "constraint_violations": violation_count,
+            "constraint_violation_clusters": [int(cluster) for cluster in violation_clusters],
+            "column_constraint_violations": model_metadata.get("column_constraint_violations", []),
+            "actual_row_clusters": actual_rows,
             "requested_n_clusters": requested_k,
             "requested_row_clusters": requested_k,
             "requested_column_clusters": int(candidate["requested_column_clusters"]) if method in ROBUST_MODELS else None,
             "actual_column_clusters": int(candidate["actual_column_clusters"]) if method in ROBUST_MODELS and candidate.get("status") == "success" else None,
-            "actual_clusters": (
-                int(candidate.get("actual_clusters", candidate["n_clusters"]))
-                if candidate.get("status") == "success"
-                else None
-            ),
+            "actual_clusters": actual_rows,
             "status": candidate.get("status"),
             "failure_reason": candidate.get("failure_reason"),
             "training_time_seconds": candidate.get("training_time_seconds"),
@@ -170,6 +193,9 @@ def resolve_cluster_selection(
     return {
         "method": method,
         "selected_pair": selected_pair,
+        "selected_row_clusters": selected_n_clusters,
+        "selected_column_clusters": selected_pair["m"] if selected_pair else None,
+        "selected_candidate_id": str(ClusterPair(**selected_pair)) if selected_pair else str(selected_n_clusters),
         "selection_mode": selection_mode,
         "configured_selected_n_clusters": configured_selection,
         "selected_n_clusters": selected_n_clusters,

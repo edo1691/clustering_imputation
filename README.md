@@ -421,7 +421,7 @@ parameters:
 cluster_search:
   enabled: true
   row_candidates: [5, 10, 15]
-  column_candidates: [2, 3, 4]
+  column_candidates: [1, 2, 3]
   selection: auto
 ```
 
@@ -432,7 +432,7 @@ been evaluated. The pair must belong to the configured grid.
 cluster_search:
   enabled: true
   row_candidates: [5, 10, 15]
-  column_candidates: [2, 3, 4]
+  column_candidates: [1, 2, 3]
   selection:
     g: 10
     m: 3
@@ -530,3 +530,24 @@ Cluster-selection reports include requested and actual customer and feature
 counts. Overall and feature reports identify both `g` and `m`. Journal LaTeX
 exports follow these tables. The overall table retains `N MAE` and omits raw
 MAE, which remains in structured and feature results.
+
+
+Grid cost grows with `len(row_candidates) * len(column_candidates)`. The supplied
+`[5, 10, 15]` by `[1, 2, 3]` grid creates nine candidate fits, each running its
+configured initialisations and CEM iterations. Full iteration histories remain
+saved for each pair, so runtime and storage also depend on `n_init`, `iter_max`,
+and the training matrix size. Matching cached candidates are reused.
+
+Selection JSON explicitly saves `selection_mode`, `selected_row_clusters`,
+`selected_column_clusters`, `selected_candidate_id`, and `selection_rule`.
+Candidate entries retain IDs, requested and actual counts, cluster-size
+summaries, metric values and statuses, ranks, scores, constraint violations,
+training times, and exclusion reasons. Existing scalar `selected_n_clusters`
+metadata remains available for customer-count consumers and other models.
+
+The cluster-selection comparison uses the columns Method, Requested g,
+Requested m, Actual row clusters, Actual column clusters, Silhouette,
+Davies--Bouldin, Calinski--Harabasz, Selection score, Selected, Training time,
+and Status. Failed and excluded pairs remain visible with reasons. Overall
+and feature reports identify the selected pair and keep their existing NC
+metrics and MAE conventions.

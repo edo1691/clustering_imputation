@@ -33,6 +33,10 @@ def test_grid_pipeline_and_candidate_reload(small_config_path, mode):
     candidates = selection["candidate_results"]
     assert len(candidates) == (1 if mode == "disabled" else 6)
     selected = storage.selected_candidate(config)
+    assert selection["selected_row_clusters"] == selected.g
+    assert selection["selected_column_clusters"] == selected.m
+    assert selection["selected_candidate_id"] == str(selected)
+    assert {item["candidate_id"] for item in candidates} == {"g_{}_m_{}".format(item["requested_n_clusters"], item["requested_column_clusters"]) for item in candidates}
     assert isinstance(selected, ClusterPair)
     if mode != "auto":
         assert selected == (3, 2)
@@ -63,7 +67,7 @@ def test_grid_pipeline_and_candidate_reload(small_config_path, mode):
     for report in ("overall_comparison", "feature_evaluation"):
         assert "g={}, m={}".format(*selected) in (config.artifact_dir / "tables" / (report+".md")).read_text()
     comparison = (config.artifact_dir / "tables/cluster_selection_comparison.md").read_text()
-    assert "Requested m" in comparison and "Actual feature clusters" in comparison
+    assert "Requested m" in comparison and "Actual column clusters" in comparison
     with patch("cluster_representation.models.custom.robcoclust_constrained.tbcem_constrained", side_effect=AssertionError("cached candidates must not refit")):
         pipeline.run(config)
 
